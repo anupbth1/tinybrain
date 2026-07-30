@@ -171,8 +171,8 @@ def run():
     tf_final = tf_hist[-1]["val_loss"] if tf_hist else 0
     tb_time = t1 - t0
     tf_time = t2 - t1
-    tb_tok_s = len(train_ds.data)*64*steps_tb/tb_time if tb_time>0 else 0
-    tf_tok_s = len(train_ds.data)*64*steps_tf/tf_time if tf_time>0 else 0
+    tb_tok_s = len(train_ds)*64*steps_tb/tb_time if tb_time>0 else 0
+    tf_tok_s = len(train_ds)*64*steps_tf/tf_time if tf_time>0 else 0
     
     print(f"\n{'='*60}")
     print("EQUAL-FLOPs RESULTS")

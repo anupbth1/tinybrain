@@ -41,10 +41,13 @@ class TinyBrainConfig:
     confidence_penalty_weight: float = 0.01
     step_penalty_weight: float = 0.1
     memory_l2_weight: float = 0.001
-    # Hybrid: lightweight causal attention after thinking cells
+    # Hybrid attention: none | post (after all cells) | per_cell (before each think loop)
     use_token_attn: bool = True
+    attn_every_cell: bool = False
     attn_dim_ratio: float = 0.25
     attn_heads: int = 1
+    # Each think step gets its own embedding so iterations are not copies
+    step_conditioned_think: bool = True
     # Non-zero init so ThinkingStep / Memory can leave the dead zone
     gamma_init: float = 0.1
     out_gate_init: float = 0.1
@@ -61,8 +64,24 @@ class ThinkingStep(nn.Module):
         self.W_e2 = nn.Linear(d, d, bias=False)
         self.do = nn.Dropout(config.dropout)
         self.gamma = nn.Parameter(torch.tensor([config.gamma_init]))
-    def forward(self, x):
-        O = self.W_o(self.ln(x))
+        self.step_conditioned = config.step_conditioned_think
+        if self.step_conditioned:
+            self.step_emb = nn.Embedding(config.max_think_steps + 1, d)
+            nn.init.normal_(self.step_emb.weight, std=config.initializer_range)
+
+    def forward(self, x, step: int = 0):
+        if self.step_conditioned:
+            B, S, _ = x.shape
+            sidx = torch.full(
+                (B, S),
+                min(step, self.step_emb.num_embeddings - 1),
+                device=x.device,
+                dtype=torch.long,
+            )
+            h = x + self.step_emb(sidx)
+        else:
+            h = x
+        O = self.W_o(self.ln(h))
         C = torch.tanh(self.W_c(O))
         E = F.silu(self.W_e1(O)) * self.W_e2(O)
         delta = torch.tanh(C * E)
@@ -177,6 +196,8 @@ class AdaptiveThinkingCell(nn.Module):
         self.W_in = nn.Linear(d, d, bias=False)
         nn.init.eye_(self.W_in.weight)
         self.W_in.skip_init = True
+        # Mix tokens BEFORE thinking so corrections use cross-token context
+        self.cell_attn = LightweightAttention(config) if config.attn_every_cell else None
         self.think = ThinkingStep(config)
         self.mem = LearnedMemory(config)
         self.conf = ConfidenceGate(config)
@@ -185,25 +206,33 @@ class AdaptiveThinkingCell(nn.Module):
         self.W_out.skip_init = True
         self.lc = config.confidence_penalty_weight
         self.ls = config.step_penalty_weight
-    def forward(self, x, memory=None):
-        x = self.W_in(x)  # Now identity, no collapse
+
+    def forward(self, x, memory=None, return_trace: bool = False):
+        x = self.W_in(x)
+        if self.cell_attn is not None:
+            x = self.cell_attn(x)
         x0 = x
         steps, csum = 0, 0.0
+        trace = []
         for t in range(self.max_s):
-            x = self.think(x)
+            x = self.think(x, step=t)
             r, memory = self.mem(x, memory)
             x = x + torch.tanh(r)
             steps += 1
+            if return_trace:
+                trace.append(x.detach())
             c, h = self.conf(x, x0, t)
             csum += c.mean().item()
             if t >= self.min_s - 1:
                 if not self.training and h.mean() > 0.5: break
                 if self.training and h.mean() > 0.8: break
-        out = self.W_out(x)  # Now identity, no collapse
+        out = self.W_out(x)
         aux = {}
         if self.training:
             aux["conf"] = self.lc * (1 - csum / max(steps, 1))
             aux["step"] = self.ls * (steps / self.max_s) ** 2
+        if return_trace:
+            aux["trace"] = trace
         return out, memory, aux
 
 

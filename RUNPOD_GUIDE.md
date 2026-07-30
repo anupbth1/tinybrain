@@ -1,67 +1,81 @@
-# RunPod / Colab Deployment Guide
+# RunPod / Colab — Scale Path (1B ≈ 600B+ feel)
 
-## Critical test right now: Hybrid vs Transformer
+## Goal (honest framing)
 
-Diagnosis showed TinyBrain loses to Transformer on TinyStories because it has
-**no cross-token interaction**. Hybrid TinyBrain adds one lightweight causal
-attention block after thinking cells (~10% extra FLOPs).
+600B models win by **depth of mixing + knowledge capacity**.
+TinyBrain's bet: **params stay ~1B**, extra intelligence comes from
+**iterative think-steps + memory + light token mixing**.
 
-### On RunPod / Colab
-
-```bash
-# Install
-pip install torch datasets
-
-# Smoke test (~10s)
-python hybrid_compare.py --verify
-
-# Main experiment (~10-20 min on GPU)
-python hybrid_compare.py --steps 500
-
-# Stronger signal (~20-40 min)
-python hybrid_compare.py --steps 1000
-```
-
-### What to paste back
-
-The script prints a `RESULTS` table like:
-
-```
-Model                   Params  ValLoss   Δ vs TF    Time
-Transformer            .......   4.xxxx   +0.0000   ...
-TB-plain               .......   4.xxxx   +0.xxxx   ...
-TB-hybrid              .......   4.xxxx   +0.xxxx   ...
-Hybrid vs Transformer: ...
-Hybrid vs Plain:       ...
-Hybrid gates: γ=...  out_gate=...
-```
-
-**Copy that whole block + the JSON path** and send it.
-
-### How to read it
-
-| Result | Meaning | Next move |
-|--------|---------|-----------|
-| Hybrid ≤ Transformer | Cross-token fix worked | Scale up / equal-FLOPs |
-| Hybrid << Plain, but still > TF | Attn helps, not enough | Attn per cell or wider attn |
-| Hybrid ≈ Plain | Attn not learning | Check W_o grads / lr |
-| γ / out_gate stay ~0.1 | Gates stuck | Raise init or lr on gates |
-
-JSON is saved to: `novacore/experiments/hybrid_results/hybrid_*.json`
+That only works if:
+1. Small-scale quality matches Transformer (gap → ~0)
+2. **More think-steps ⇒ better loss** at fixed params (compute scaling)
+3. Then grow to 1B params with a large think budget
 
 ---
 
-## Older modes (still valid)
+## What just landed (Hybrid results)
 
-```bash
-python runpod_ready.py --mode verify
-python runpod_ready.py --mode proof
-python runpod_ready.py --mode ablation
+| Model | ValLoss | Δ vs TF |
+|-------|---------|---------|
+| Transformer | 4.0663 | 0 |
+| TB-plain | 4.4287 | +0.36 |
+| TB-hybrid v1 | 4.2878 | +0.22 |
+
+Hybrid helps. Next: **v2** (attn before each cell + step-conditioned think).
+
+---
+
+## Colab / RunPod commands (use `!` in notebook)
+
+```python
+!git clone https://github.com/anupbth1/tinybrain.git
+%cd tinybrain
+!pip install -q datasets
+!git pull
+!python scale_path.py --verify
 ```
 
-## Files to download after a run
+### Experiment order (run in order, paste RESULTS each time)
+
+```python
+# 1) Close the gap? (~15-40 min GPU)
+!python scale_path.py --mode race --steps 2000
+
+# 2) Are iterations actually refining? (~10-20 min)
+!python scale_path.py --mode diagnose --steps 1000
+
+# 3) Critical for 1B=600B: more think ⇒ better? (~20-40 min)
+!python scale_path.py --mode think_scale --steps 800
+```
+
+---
+
+## Decision tree
+
+| Race result | Action |
+|-------------|--------|
+| v2 gap ≤ 0.10 vs TF | Go to think_scale |
+| v2 better than v1 but gap > 0.15 | Longer train (5k) or wider attn |
+| v2 ≤ v1 | Revert placement; try post+wider only |
+
+| think_scale result | Action |
+|--------------------|--------|
+| T8 < T1 (COMPUTE_SCALES) | Scale params toward 50M→1B |
+| T8 ≥ T1 | Fix iteration diversity before any scaling |
+
+---
+
+## How 1B gets 600B+ *feel*
+
+Not magic compression of weights. Mechanism:
 
 ```
-novacore/experiments/hybrid_results/hybrid_*.json
-checkpoints/   # if you used runpod_ready proof mode
+Transformer 600B:  quality ≈ f(params, layers, data)
+TinyBrain 1B:      quality ≈ f(params, think_steps, memory, data)
 ```
+
+If `∂quality/∂think_steps > 0`, you can spend FLOPs at inference
+like a deeper model without storing 600B weights.
+That is the only credible path to "1B feels like 600B+".
+
+Until think_scale says COMPUTE_SCALES, do **not** jump to 1B training.

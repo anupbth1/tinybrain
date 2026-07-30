@@ -1,1 +1,10 @@
-from .tiny_brain import TinyBrainConfig, TinyBrainModel, ThinkingStep, LearnedMemory, ConfidenceGate, AdaptiveThinkingCell, SelfCorrection
+from .tiny_brain import (
+    TinyBrainConfig,
+    TinyBrainModel,
+    ThinkingStep,
+    LearnedMemory,
+    ConfidenceGate,
+    AdaptiveThinkingCell,
+    SelfCorrection,
+    LightweightAttention,
+)

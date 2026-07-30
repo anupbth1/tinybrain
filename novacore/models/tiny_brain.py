@@ -41,6 +41,13 @@ class TinyBrainConfig:
     confidence_penalty_weight: float = 0.01
     step_penalty_weight: float = 0.1
     memory_l2_weight: float = 0.001
+    # Hybrid: lightweight causal attention after thinking cells
+    use_token_attn: bool = True
+    attn_dim_ratio: float = 0.25
+    attn_heads: int = 1
+    # Non-zero init so ThinkingStep / Memory can leave the dead zone
+    gamma_init: float = 0.1
+    out_gate_init: float = 0.1
 
 
 class ThinkingStep(nn.Module):
@@ -53,7 +60,7 @@ class ThinkingStep(nn.Module):
         self.W_e1 = nn.Linear(d, d, bias=False)
         self.W_e2 = nn.Linear(d, d, bias=False)
         self.do = nn.Dropout(config.dropout)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.tensor([config.gamma_init]))
     def forward(self, x):
         O = self.W_o(self.ln(x))
         C = torch.tanh(self.W_c(O))
@@ -74,7 +81,7 @@ class LearnedMemory(nn.Module):
         self.W_i = nn.Linear(d, 1, bias=True)
         self.M0 = nn.Parameter(torch.randn(m, d) * config.initializer_range)
         self.eta = config.memory_compress_rate
-        self.out_gate = nn.Parameter(torch.zeros(1))
+        self.out_gate = nn.Parameter(torch.tensor([config.out_gate_init]))
     def forward(self, x, mem=None):
         B, S, d = x.shape
         m = self.M0.shape[0]
@@ -95,6 +102,44 @@ class LearnedMemory(nn.Module):
             mem = mem * (I > 0.1).float()
         r_gated = torch.tanh(self.out_gate) * r
         return r_gated, mem
+
+
+class LightweightAttention(nn.Module):
+    """Single-pass causal attention for cross-token mixing (~10% extra FLOPs).
+
+    Diagnosis: ThinkingStep/Memory alone cannot do token-token relations
+    (subject-verb, coreference). This closes that gap without full Transformer.
+    """
+    def __init__(self, config):
+        super().__init__()
+        d = config.hidden_size
+        self.n_heads = max(1, config.attn_heads)
+        self.attn_dim = max(self.n_heads, int(d * config.attn_dim_ratio))
+        # Round down so attn_dim is divisible by heads
+        self.head_dim = self.attn_dim // self.n_heads
+        self.attn_dim = self.head_dim * self.n_heads
+        self.ln = RMSNorm(d, config.layer_norm_eps)
+        self.W_q = nn.Linear(d, self.attn_dim, bias=False)
+        self.W_k = nn.Linear(d, self.attn_dim, bias=False)
+        self.W_v = nn.Linear(d, self.attn_dim, bias=False)
+        self.W_o = nn.Linear(self.attn_dim, d, bias=False)
+        self.do = nn.Dropout(config.dropout)
+        # Start near identity residual so early training is stable
+        nn.init.zeros_(self.W_o.weight)
+        self.W_o.skip_init = True
+
+    def forward(self, x):
+        B, S, d = x.shape
+        h = self.ln(x)
+        q = self.W_q(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.W_k(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        causal = torch.triu(torch.full((S, S), float("-inf"), device=x.device, dtype=scores.dtype), diagonal=1)
+        scores = scores + causal
+        attn = self.do(F.softmax(scores, dim=-1))
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, S, self.attn_dim)
+        return x + self.W_o(out)
 
 
 class ConfidenceGate(nn.Module):
@@ -166,12 +211,14 @@ class SelfCorrection(nn.Module):
     def __init__(self, config):
         super().__init__()
         d = config.hidden_size
+        self.correction_steps = config.correction_steps
         self.verify = nn.Sequential(RMSNorm(d, config.layer_norm_eps), nn.Linear(d, 1))
         self.refine = nn.Sequential(RMSNorm(d, config.layer_norm_eps), nn.Linear(d, d), nn.SiLU())
         self.gate = nn.Sequential(nn.Linear(d, 1), nn.Sigmoid())
         self.do = nn.Dropout(config.dropout)
     def forward(self, x):
-        for _ in range(self.correction_steps if hasattr(self, 'correction_steps') else 1):
+        v = None
+        for _ in range(self.correction_steps):
             v = torch.sigmoid(self.verify(x))
             r = self.refine(x)
             g = self.gate(x) * (1 - v)
@@ -185,6 +232,7 @@ class TinyBrainModel(nn.Module):
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
         self.cells = nn.ModuleList([AdaptiveThinkingCell(config, i) for i in range(config.num_cells)])
+        self.token_attn = LightweightAttention(config) if config.use_token_attn else None
         self.sc = SelfCorrection(config)
         self.out_mlp = nn.Sequential(
             RMSNorm(config.hidden_size, config.layer_norm_eps),
@@ -217,6 +265,8 @@ class TinyBrainModel(nn.Module):
             x, mem, a = cell(x, memory_states[i])
             new_mems.append(mem)
             for k, v in a.items(): aux[f"c{i}_{k}"] = v
+        if self.token_attn is not None:
+            x = self.token_attn(x)
         x, vs = self.sc(x)
         x = self.out_mlp(x)
         logits = self.lm_head(x)

@@ -118,7 +118,7 @@ def train_and_diagnose(steps=100):
     
     # Data
     torch.manual_seed(42)
-    data = torch.randint(2, 200, (100, 64))
+    data = torch.randint(2, 200, (100, 64), device=DEVICE)
     all_results = []
     
     for step in range(steps):

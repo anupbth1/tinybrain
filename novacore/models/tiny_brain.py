@@ -1,6 +1,8 @@
 """
 TinyBrain — Self-contained implementation.
-No external package imports (RMSNorm inlined).
+BUGFIX: W_in and W_out now identity init to prevent signal collapse.
+Previously: random init causing 1600x norm collapse (1.28 → 0.0008)
+Now: identity init preserves hidden state norm through cells.
 """
 import math
 from dataclasses import dataclass
@@ -15,7 +17,6 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
     def forward(self, x):
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x * rms * self.weight
@@ -43,7 +44,6 @@ class TinyBrainConfig:
 
 
 class ThinkingStep(nn.Module):
-    """x_{t+1} = x_t + tanh(W_c·O) ⊙ SiLU(W_e1·O)⊙W_e2·O,  O = W_o·LN(x)"""
     def __init__(self, config):
         super().__init__()
         d = config.hidden_size
@@ -53,24 +53,16 @@ class ThinkingStep(nn.Module):
         self.W_e1 = nn.Linear(d, d, bias=False)
         self.W_e2 = nn.Linear(d, d, bias=False)
         self.do = nn.Dropout(config.dropout)
-        # Learnable scale: init to 0 so network starts as identity (stable)
         self.gamma = nn.Parameter(torch.zeros(1))
-
     def forward(self, x):
         O = self.W_o(self.ln(x))
         C = torch.tanh(self.W_c(O))
         E = F.silu(self.W_e1(O)) * self.W_e2(O)
-        # x_{t+1} = x_t + gamma * tanh(C ⊙ E)
-        # gamma=0 at init → identity mapping (stable)
-        # gamma learned during training
         delta = torch.tanh(C * E)
         return x + torch.tanh(self.gamma) * self.do(delta)
 
 
 class LearnedMemory(nn.Module):
-    """Read: α = softmax(q·M^T/√d), r = α·M
-       Write: gated erase + add
-       Compress: importance decay"""
     def __init__(self, config):
         super().__init__()
         d, m = config.hidden_size, config.memory_slots
@@ -82,9 +74,7 @@ class LearnedMemory(nn.Module):
         self.W_i = nn.Linear(d, 1, bias=True)
         self.M0 = nn.Parameter(torch.randn(m, d) * config.initializer_range)
         self.eta = config.memory_compress_rate
-        # Learnable output gate: init to 0 so memory starts as silent (stable)
         self.out_gate = nn.Parameter(torch.zeros(1))
-
     def forward(self, x, mem=None):
         B, S, d = x.shape
         m = self.M0.shape[0]
@@ -103,25 +93,22 @@ class LearnedMemory(nn.Module):
             mem = mem * (1 - (1 - I) * self.eta)
         else:
             mem = mem * (I > 0.1).float()
-        # Gate the read output: out_gate=0 → memory is silent (contributes nothing)
         r_gated = torch.tanh(self.out_gate) * r
         return r_gated, mem
 
 
 class ConfidenceGate(nn.Module):
-    """c_t = sigmoid(W_conf·[x_t; x_t-x_0] + step_embed + b)"""
     def __init__(self, config):
         super().__init__()
         d = config.hidden_size
-        self.step_emb = nn.Embedding(config.max_think_steps + 1, 2*d)  # 2d to match [x; x-x0]
+        self.step_emb = nn.Embedding(config.max_think_steps + 1, 2*d)
         self.ln = RMSNorm(2*d, config.layer_norm_eps)
         self.proj = nn.Linear(2*d, 1, bias=True)
         self.thresh = config.confidence_threshold
-
     def forward(self, x, x0, step):
         B, S, d = x.shape
         sidx = torch.full((B,S), min(step, self.step_emb.num_embeddings-1), device=x.device, dtype=torch.long)
-        e = self.step_emb(sidx)  # (B,S,2d)
+        e = self.step_emb(sidx)
         inp = torch.cat([x, x - x0], dim=-1) + e
         inp = self.ln(inp)
         logit = self.proj(inp)
@@ -141,22 +128,25 @@ class AdaptiveThinkingCell(nn.Module):
         self.idx = idx
         self.max_s = config.max_think_steps
         self.min_s = config.min_think_steps
+        # BUGFIX: Identity init prevents 1600x signal collapse
         self.W_in = nn.Linear(d, d, bias=False)
+        nn.init.eye_(self.W_in.weight)
+        self.W_in.skip_init = True
         self.think = ThinkingStep(config)
         self.mem = LearnedMemory(config)
         self.conf = ConfidenceGate(config)
         self.W_out = nn.Linear(d, d, bias=False)
+        nn.init.eye_(self.W_out.weight)
+        self.W_out.skip_init = True
         self.lc = config.confidence_penalty_weight
         self.ls = config.step_penalty_weight
-
     def forward(self, x, memory=None):
-        x = self.W_in(x)
+        x = self.W_in(x)  # Now identity, no collapse
         x0 = x
         steps, csum = 0, 0.0
         for t in range(self.max_s):
             x = self.think(x)
             r, memory = self.mem(x, memory)
-            # Bound memory residual with tanh to prevent divergence
             x = x + torch.tanh(r)
             steps += 1
             c, h = self.conf(x, x0, t)
@@ -164,7 +154,7 @@ class AdaptiveThinkingCell(nn.Module):
             if t >= self.min_s - 1:
                 if not self.training and h.mean() > 0.5: break
                 if self.training and h.mean() > 0.8: break
-        out = self.W_out(x)
+        out = self.W_out(x)  # Now identity, no collapse
         aux = {}
         if self.training:
             aux["conf"] = self.lc * (1 - csum / max(steps, 1))
@@ -180,7 +170,6 @@ class SelfCorrection(nn.Module):
         self.refine = nn.Sequential(RMSNorm(d, config.layer_norm_eps), nn.Linear(d, d), nn.SiLU())
         self.gate = nn.Sequential(nn.Linear(d, 1), nn.Sigmoid())
         self.do = nn.Dropout(config.dropout)
-
     def forward(self, x):
         for _ in range(self.correction_steps if hasattr(self, 'correction_steps') else 1):
             v = torch.sigmoid(self.verify(x))
@@ -207,16 +196,16 @@ class TinyBrainModel(nn.Module):
         self.embed.weight = self.lm_head.weight
         self.lm = config.memory_l2_weight
         self._init()
-
     def _init(self):
         s = self.config.initializer_range
         for m in self.modules():
             if isinstance(m, nn.Linear):
+                if hasattr(m, 'skip_init') and m.skip_init:
+                    continue
                 m.weight.data.normal_(0, s)
                 if m.bias is not None: m.bias.data.zero_()
             elif isinstance(m, nn.Embedding):
                 m.weight.data.normal_(0, s)
-
     def forward(self, input_ids, labels=None, memory_states=None):
         K = self.config.num_cells
         x = self.embed(input_ids)

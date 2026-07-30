@@ -40,7 +40,7 @@ TinyBrainModel = tb.TinyBrainModel
 from novacore.core.simple_model import NovaModel, create_transformer
 from novacore.core.config import NovaConfig
 
-DEVICE = "cpu"  # Explicitly CPU for verification
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # Auto-detect GPU
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 

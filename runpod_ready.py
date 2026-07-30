@@ -83,6 +83,7 @@ def evaluate(model, loader, n_batches=10):
     count = 0
     for x, y in loader:
         if count >= n_batches: break
+        x, y = x.to(DEVICE), y.to(DEVICE)
         out = model(x, labels=y)
         total_loss += out["loss"].item()
         count += 1
@@ -228,6 +229,7 @@ def train_model(model, train_loader, val_loader, steps=2000, lr=3e-4, save_every
         for x, y in train_loader:
             if step >= steps: break
             
+            x, y = x.to(DEVICE), y.to(DEVICE)  # Move to GPU
             opt.zero_grad()
             out = model(x, labels=y)
             loss = out["loss"]
@@ -274,9 +276,10 @@ def mode_verify():
         ("Ablation (no self-corr)", lambda: create_ablated_model(remove_selfcorr=True)),
     ]:
         model, cfg, n = fn() if len(fn()) == 3 else (*fn(), 0)
+        model = model.to(DEVICE)  # <- ADDED
         if n == 0:
             n = sum(p.numel() for p in model.parameters())
-        x = torch.randint(0, 100, (2, 32))
+        x = torch.randint(0, 100, (2, 32)).to(DEVICE)  # <- ADDED .to(DEVICE)
         out = model(x, labels=x)
         loss = out["loss"].item()
         stats = get_stats(model)
@@ -303,7 +306,9 @@ def mode_proof():
     # Models
     print("\n🤖 Creating models...")
     tb_model, _, _ = create_model_5m()
+    tb_model = tb_model.to(DEVICE)
     tf_model, _, _ = create_transformer_5m()
+    tf_model = tf_model.to(DEVICE)
     n_tb = sum(p.numel() for p in tb_model.parameters())
     n_tf = sum(p.numel() for p in tf_model.parameters())
     print(f"  TinyBrain:   {n_tb:>8,} params")

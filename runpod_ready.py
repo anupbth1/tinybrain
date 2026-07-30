@@ -398,7 +398,9 @@ def mode_ablation():
     
     all_history = {}
     for name, fn in variants:
-        model, _, _ = fn()
+        result = fn()
+        model = result[0]  # First return value is always the model
+        model = model.to(DEVICE)
         print(f"\n🏋️  Training variant: {name}", flush=True)
         history = train_model(model, train_loader, val_loader, steps=500, name=name)
         all_history[name] = history

@@ -1,0 +1,19 @@
+{
+  "dataset": "tinystories",
+  "tinybrain": {
+    "params": 5590382,
+    "flops": 588218368,
+    "steps": 500,
+    "final_val": 4.446003533899784,
+    "time": 40.18
+  },
+  "transformer": {
+    "params": 7572224,
+    "flops": 627015680.0,
+    "steps": 469,
+    "final_val": 3.8438830748200417,
+    "time": 20.24
+  },
+  "winner": "Transformer",
+  "margin": 0.6021
+}

@@ -1,0 +1,212 @@
+{
+  "seed_42": {
+    "tinybrain": {
+      "params": 3233646,
+      "history": [
+        {
+          "step": 500,
+          "train_loss": 6.972938537597656,
+          "val_loss": 5.9656885147094725,
+          "mean_gamma": -0.0015631061542080715,
+          "mean_gamma_grad": 0.003835006345373889,
+          "max_gamma": 0.015067038126289845,
+          "min_gamma": -0.01996082067489624,
+          "mean_gate": -0.007097312559684117,
+          "mean_gate_grad": 0.002959368983283639,
+          "mem_active_ratio": 1.0,
+          "mem_entropy": 2.7724618911743164,
+          "mem_write_strength": 0.045172154903411865
+        },
+        {
+          "step": 1000,
+          "train_loss": 6.453965187072754,
+          "val_loss": 5.990708827972412,
+          "mean_gamma": 0.0020276535845672092,
+          "mean_gamma_grad": 0.09845020171875755,
+          "max_gamma": 0.01598137989640236,
+          "min_gamma": -0.011791322380304337,
+          "mean_gate": -0.003931681935985883,
+          "mean_gate_grad": 0.04476202900211016,
+          "mem_active_ratio": 1.0,
+          "mem_entropy": 2.772451877593994,
+          "mem_write_strength": 0.04917703568935394
+        }
+      ],
+      "time_sec": 63.828983545303345
+    },
+    "transformer": {
+      "params": 3903744,
+      "history": [
+        {
+          "step": 500,
+          "train_loss": 6.234633445739746,
+          "val_loss": 6.086647796630859,
+          "mean_gamma": 0,
+          "mean_gamma_grad": 0,
+          "max_gamma": 0,
+          "min_gamma": 0,
+          "mean_gate": 0,
+          "mean_gate_grad": 0,
+          "mem_active_ratio": 0,
+          "mem_entropy": 0.0,
+          "mem_write_strength": 0.0
+        },
+        {
+          "step": 1000,
+          "train_loss": 5.918105602264404,
+          "val_loss": 6.016714191436767,
+          "mean_gamma": 0,
+          "mean_gamma_grad": 0,
+          "max_gamma": 0,
+          "min_gamma": 0,
+          "mean_gate": 0,
+          "mean_gate_grad": 0,
+          "mem_active_ratio": 0,
+          "mem_entropy": 0.0,
+          "mem_write_strength": 0.0
+        }
+      ],
+      "time_sec": 21.429009914398193
+    }
+  },
+  "seed_123": {
+    "tinybrain": {
+      "params": 3233646,
+      "history": [
+        {
+          "step": 500,
+          "train_loss": 6.17495059967041,
+          "val_loss": 5.911830997467041,
+          "mean_gamma": 0.01234516000840813,
+          "mean_gamma_grad": 0.12471503174553315,
+          "max_gamma": 0.026744486764073372,
+          "min_gamma": 0.0009907287312671542,
+          "mean_gate": 0.025370270013809204,
+          "mean_gate_grad": 0.05683755377928416,
+          "mem_active_ratio": 1.0,
+          "mem_entropy": 2.7724785804748535,
+          "mem_write_strength": 0.04283612221479416
+        },
+        {
+          "step": 1000,
+          "train_loss": 7.242470741271973,
+          "val_loss": 5.925677871704101,
+          "mean_gamma": 0.010519380836437145,
+          "mean_gamma_grad": 0.11987124631802241,
+          "max_gamma": 0.019556524232029915,
+          "min_gamma": 0.0012927115894854069,
+          "mean_gate": 0.027255842462182045,
+          "mean_gate_grad": 0.09078426659107208,
+          "mem_active_ratio": 1.0,
+          "mem_entropy": 2.772486686706543,
+          "mem_write_strength": 0.050433263182640076
+        }
+      ],
+      "time_sec": 64.88842964172363
+    },
+    "transformer": {
+      "params": 3903744,
+      "history": [
+        {
+          "step": 500,
+          "train_loss": 6.217626571655273,
+          "val_loss": 6.024399948120117,
+          "mean_gamma": 0,
+          "mean_gamma_grad": 0,
+          "max_gamma": 0,
+          "min_gamma": 0,
+          "mean_gate": 0,
+          "mean_gate_grad": 0,
+          "mem_active_ratio": 0,
+          "mem_entropy": 0.0,
+          "mem_write_strength": 0.0
+        },
+        {
+          "step": 1000,
+          "train_loss": 4.837148189544678,
+          "val_loss": 5.961054801940918,
+          "mean_gamma": 0,
+          "mean_gamma_grad": 0,
+          "max_gamma": 0,
+          "min_gamma": 0,
+          "mean_gate": 0,
+          "mean_gate_grad": 0,
+          "mem_active_ratio": 0,
+          "mem_entropy": 0.0,
+          "mem_write_strength": 0.0
+        }
+      ],
+      "time_sec": 21.468016386032104
+    }
+  },
+  "seed_999": {
+    "tinybrain": {
+      "params": 3233646,
+      "history": [
+        {
+          "step": 500,
+          "train_loss": 5.908835411071777,
+          "val_loss": 5.696381282806397,
+          "mean_gamma": 0.009873613215556057,
+          "mean_gamma_grad": 0.009060352468926188,
+          "max_gamma": 0.02980804443359375,
+          "min_gamma": -0.00037680845707654953,
+          "mean_gate": 0.02357599511742592,
+          "mean_gate_grad": 0.039082612842321396,
+          "mem_active_ratio": 1.0,
+          "mem_entropy": 2.7724921703338623,
+          "mem_write_strength": 0.043547794222831726
+        },
+        {
+          "step": 1000,
+          "train_loss": 6.000137805938721,
+          "val_loss": 5.739914417266846,
+          "mean_gamma": 0.00907900968256096,
+          "mean_gamma_grad": 0.10896181470404069,
+          "max_gamma": 0.02600128762423992,
+          "min_gamma": 0.00030399177921935916,
+          "mean_gate": 0.026013179992636044,
+          "mean_gate_grad": 0.0585477533750236,
+          "mem_active_ratio": 1.0,
+          "mem_entropy": 2.7724926471710205,
+          "mem_write_strength": 0.04874899983406067
+        }
+      ],
+      "time_sec": 64.35886359214783
+    },
+    "transformer": {
+      "params": 3903744,
+      "history": [
+        {
+          "step": 500,
+          "train_loss": 5.200021743774414,
+          "val_loss": 5.818393516540527,
+          "mean_gamma": 0,
+          "mean_gamma_grad": 0,
+          "max_gamma": 0,
+          "min_gamma": 0,
+          "mean_gate": 0,
+          "mean_gate_grad": 0,
+          "mem_active_ratio": 0,
+          "mem_entropy": 0.0,
+          "mem_write_strength": 0.0
+        },
+        {
+          "step": 1000,
+          "train_loss": 5.375836372375488,
+          "val_loss": 5.749956893920898,
+          "mean_gamma": 0,
+          "mean_gamma_grad": 0,
+          "max_gamma": 0,
+          "min_gamma": 0,
+          "mean_gate": 0,
+          "mean_gate_grad": 0,
+          "mem_active_ratio": 0,
+          "mem_entropy": 0.0,
+          "mem_write_strength": 0.0
+        }
+      ],
+      "time_sec": 21.386329412460327
+    }
+  }
+}

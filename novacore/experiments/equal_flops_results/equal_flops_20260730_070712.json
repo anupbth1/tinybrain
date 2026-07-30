@@ -1,0 +1,18 @@
+{
+  "tinybrain": {
+    "params": 3233646,
+    "flops": 437387264,
+    "steps": 500,
+    "final_val": 5.715710088610649,
+    "time": 34.18932795524597
+  },
+  "transformer": {
+    "params": 5215488,
+    "flops": 476184576.0,
+    "steps": 459,
+    "final_val": 6.079526096582413,
+    "time": 13.707204341888428
+  },
+  "winner": "TinyBrain",
+  "margin": 0.3638160079717636
+}

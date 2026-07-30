@@ -1,0 +1,19 @@
+{
+  "dataset": "synthetic",
+  "tinybrain": {
+    "params": 3233646,
+    "flops": 437387264,
+    "steps": 500,
+    "final_val": 5.714558184146881,
+    "time": 33.79
+  },
+  "transformer": {
+    "params": 5215488,
+    "flops": 476184576.0,
+    "steps": 459,
+    "final_val": 6.077894955873489,
+    "time": 13.89
+  },
+  "winner": "TinyBrain",
+  "margin": 0.3633
+}

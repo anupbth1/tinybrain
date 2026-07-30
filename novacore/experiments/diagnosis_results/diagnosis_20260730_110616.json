@@ -1,0 +1,38 @@
+{
+  "transformer": {
+    "val_loss": 4.2887,
+    "time_sec": 8.2
+  },
+  "full_tinybrain": {
+    "val_loss": 4.7839,
+    "time_sec": 20.21
+  },
+  "no_thinkingstep": {
+    "val_loss": 4.7806,
+    "time_sec": 20.05
+  },
+  "no_memory": {
+    "val_loss": 4.7835,
+    "time_sec": 20.49
+  },
+  "fixed_2_steps": {
+    "val_loss": 4.729,
+    "time_sec": 13.2
+  },
+  "fixed_4_steps": {
+    "val_loss": 4.7946,
+    "time_sec": 21.34
+  },
+  "fixed_8_steps": {
+    "val_loss": 4.7639,
+    "time_sec": 36.78
+  },
+  "fixed_16_steps": {
+    "val_loss": 4.7653,
+    "time_sec": 70.26
+  },
+  "memory_read_only": {
+    "val_loss": 4.7487,
+    "time_sec": 21.01
+  }
+}

@@ -1,6 +1,6 @@
 """
 Diagnose TinyBrain failure on TinyStories.
-Run this on RunPod.
+Saves results to JSON in novacore/experiments/diagnosis_results/
 """
 import sys, os, json, math, time
 from pathlib import Path
@@ -19,8 +19,8 @@ from novacore.core.simple_model import NovaModel
 from novacore.core.config import NovaConfig
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-RES = Path("novacore/experiments/diagnosis_results")
-RES.mkdir(parents=True, exist_ok=True)
+RES_DIR = Path("novacore/experiments/diagnosis_results")
+RES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_tinystories(max_samples=5000):
@@ -63,7 +63,7 @@ def quick_train(model, tl, vl, steps=300, name="model"):
             vl_+=model(x2,labels=y2)["loss"].item()
     vl_/=len(vl)
     print(f"  {name:25s}: val_loss={vl_:.4f} | time={t1-t0:.1f}s")
-    return vl_, t1-t0
+    return {"val_loss": round(float(vl_), 4), "time_sec": round(float(t1-t0), 2)}
 
 
 def run():
@@ -87,48 +87,54 @@ def run():
     vl=DataLoader(D(data[split:]),32)
     print(f"  {len(data)} seqs, vocab={vocab}")
 
+    results = {}
+
     # Baseline: Transformer
     print("\n--- BASELINE ---")
     tf_cfg = NovaConfig(vocab_size=vocab, hidden_size=256, num_layers=3, num_attention_heads=4, intermediate_size=768, max_seq_length=64)
     tf_m = NovaModel(tf_cfg).to(DEVICE)
-    quick_train(tf_m, tl, vl, 300, "Transformer")
+    results["transformer"] = quick_train(tf_m, tl, vl, 300, "Transformer")
 
     # Full TinyBrain
     print("\n--- FULL TINYBRAIN ---")
     tb_cfg = TinyBrainConfig(vocab_size=vocab, hidden_size=256, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=4, output_mlp_hidden=512)
     tb_m = TinyBrainModel(tb_cfg).to(DEVICE)
-    quick_train(tb_m, tl, vl, 300, "Full TinyBrain")
+    results["full_tinybrain"] = quick_train(tb_m, tl, vl, 300, "Full TinyBrain")
 
     # H1: No ThinkingStep (gamma=0)
     print("\n--- H1: NO THINKINGSTEP ---")
     h1_m = TinyBrainModel(TinyBrainConfig(vocab_size=vocab, hidden_size=256, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=4, output_mlp_hidden=512)).to(DEVICE)
     for n,p in h1_m.named_parameters():
         if "gamma" in n: p.data.zero_(); p.requires_grad=False
-    quick_train(h1_m, tl, vl, 300, "H1: No ThinkingStep")
+    results["no_thinkingstep"] = quick_train(h1_m, tl, vl, 300, "H1: No ThinkingStep")
 
     # H2: No Memory (out_gate=0)
     print("\n--- H2: NO MEMORY ---")
     h2_m = TinyBrainModel(TinyBrainConfig(vocab_size=vocab, hidden_size=256, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=4, output_mlp_hidden=512)).to(DEVICE)
     for n,p in h2_m.named_parameters():
         if "out_gate" in n: p.data.zero_(); p.requires_grad=False
-    quick_train(h2_m, tl, vl, 300, "H2: No Memory")
+    results["no_memory"] = quick_train(h2_m, tl, vl, 300, "H2: No Memory")
 
     # H3: Fixed steps (2,4,8,16)
     print("\n--- H3: FIXED STEPS ---")
     for s in [2,4,8,16]:
         cfg_s = TinyBrainConfig(vocab_size=vocab, hidden_size=256, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=s, min_think_steps=s, output_mlp_hidden=512)
         m_s = TinyBrainModel(cfg_s).to(DEVICE)
-        quick_train(m_s, tl, vl, 300, f"H3: always {s} steps")
+        results[f"fixed_{s}_steps"] = quick_train(m_s, tl, vl, 300, f"H3: always {s} steps")
 
     # H4: Memory read-only (write gate frozen at 0)
     print("\n--- H4: MEMORY READ-ONLY ---")
     h4_m = TinyBrainModel(TinyBrainConfig(vocab_size=vocab, hidden_size=256, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=4, output_mlp_hidden=512)).to(DEVICE)
     for n,p in h4_m.named_parameters():
         if "W_w" in n: p.data.zero_(); p.requires_grad=False
-    quick_train(h4_m, tl, vl, 300, "H4: Memory read-only")
+    results["memory_read_only"] = quick_train(h4_m, tl, vl, 300, "H4: Memory read-only")
 
-    print("\n"+"="*60)
-    print("DONE. Check novacore/experiments/diagnosis_results/")
+    # Save results to JSON
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = RES_DIR / f"diagnosis_{ts}.json"
+    with open(outfile, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to: {outfile}")
     print("="*60)
 
 if __name__=="__main__":

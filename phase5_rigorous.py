@@ -100,12 +100,15 @@ class SimpleDataset(torch.utils.data.Dataset):
         return x, x.clone()
 
 
-def create_model(name, vocab_size=5000, hidden=256):
+def create_model(name, vocab_size=5000, hidden=256, fair_flops=False):
+    """Create model. If fair_flops, match Transformer compute to TinyBrain."""
     if name == "tinybrain":
-        cfg = TinyBrainConfig(vocab_size=vocab_size, hidden_size=hidden, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=8, min_think_steps=1, output_mlp_hidden=hidden*2)
+        cfg = TinyBrainConfig(vocab_size=vocab_size, hidden_size=hidden, num_cells=3, memory_slots=16, num_think_heads=2, max_think_steps=4, min_think_steps=1, output_mlp_hidden=hidden*2)
         model = TinyBrainModel(cfg)
     elif name == "transformer":
-        cfg = NovaConfig(vocab_size=vocab_size, hidden_size=hidden, num_layers=4, num_attention_heads=4, intermediate_size=hidden*3, max_seq_length=128)
+        # With fair_flops, increase layers to match TinyBrain's 3 cells × 4 steps ≈ 12 operations
+        layers = 6 if fair_flops else 4
+        cfg = NovaConfig(vocab_size=vocab_size, hidden_size=hidden, num_layers=layers, num_attention_heads=4, intermediate_size=hidden*3, max_seq_length=128)
         model = NovaModel(cfg)
     return model.to(DEVICE), sum(p.numel() for p in model.parameters())
 
@@ -188,7 +191,7 @@ def train(model, train_loader, val_loader, steps=2000, lr=3e-4, save_every=500):
     return history
 
 
-def run_seed(seed, data_source="synthetic", vocab=5000, steps=2000):
+def run_seed(seed, data_source="synthetic", vocab=5000, steps=2000, fair_flops=False):
     """Full experiment for one seed."""
     print(f"\n{'='*60}")
     print(f"Seed {seed} | Data: {data_source}")
@@ -216,7 +219,7 @@ def run_seed(seed, data_source="synthetic", vocab=5000, steps=2000):
     all_results = {}
     
     for name in models_to_test:
-        model, n_params = create_model(name, vocab_size=vocab)
+        model, n_params = create_model(name, vocab_size=vocab, fair_flops=fair_flops)
         print(f"\n{name}: {n_params:,} params")
         t0 = time.time()
         history = train(model, train_loader, val_loader, steps=steps)

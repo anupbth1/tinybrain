@@ -13,11 +13,15 @@ Usage (Colab/RunPod — use ! in notebook cells):
   !python scale_path.py --mode think_scale --steps 800
   !python scale_path.py --mode equal_flops --dataset wikitext   # Phase B: OOD prose
   !python scale_path.py --mode equal_flops --memory_sharp 32    # sharper slot read
+  !python scale_path.py --mode equal_flops --think_steps 8      # thesis: more thinking vs TF
+  !python scale_path.py --mode equal_flops --think_steps 8 --tf_layers 6   # V2-T8 vs bigger TF
 
 Fairness defaults: LR schedule keyed to TOKENS (warmup+cosine), equal-FLOPs
 compares BEST val with paired t-test/sign test over seeds, full budget per
 model (no early stop in the race), tokens+wall-clock reported per model.
-Paste the RESULTS block back.
+FLOPs are PROFILER-MEASURED (torch FlopCounterMode, incl. lm_head) — the old
+hand-rolled counters swung the TF:V2 ratio by >2x and invalidated the
+earlier 'V2 wins' result. Paste the RESULTS block back.
 """
 import argparse
 import json
@@ -49,6 +53,8 @@ from novacore.core.config import NovaConfig
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 RES_DIR = Path("novacore/experiments/scale_path_results")
 RES_DIR.mkdir(parents=True, exist_ok=True)
+
+SEQ_LEN = 64  # fixed sequence length used by every loader in this harness
 
 
 def _word_vocab(texts, top_k=30000, seq_len=64, max_words=50):
@@ -84,9 +90,13 @@ def load_tinystories(max_samples=5000, seq_len=64):
 
 
 def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
-    """WikiText-2 raw — out-of-distribution vs TinyStories (prose → encyclopedia)."""
+    """WikiText-2 raw — out-of-distribution vs TinyStories (prose → encyclopedia).
+
+    Note: HF moved the wikitext dataset to the Salesforce namespace; the bare
+    repo id 'wikitext' fails on newer datasets versions (HfUriError).
+    """
     from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
     texts = [t.strip() for t in ds["text"] if len(t.strip()) > 5]
     if max_samples:
         texts = texts[:max_samples]
@@ -181,6 +191,33 @@ def estimate_fwd_flops(model, seq_len=64, batch=1):
     head = 2 * seq_len * d * cfg.output_mlp_hidden
     head += cfg.correction_steps * 2 * seq_len * d * d
     return int(batch * (think + mem + attn + head))
+
+
+def measure_fwd_flops(model, seq_len=SEQ_LEN):
+    """Real per-step forward FLOPs via torch's FlopCounterMode (incl. lm_head).
+
+    Hand-rolled counters have proven unreliable (they swung the TF:V2 ratio by
+    >2x — measured TF is ~6x the old estimate). Measured numbers are what
+    reviewers will trust. Returns None if the profiler is unavailable.
+    """
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+    except Exception:
+        return None
+    was_training = model.training
+    model.train()  # training cost (dropout + full think loop), not eval cost
+    try:
+        vocab = getattr(model.config, "vocab_size", 1000)
+        x = torch.randint(0, max(1, min(vocab, 50000)), (1, seq_len),
+                          device=next(model.parameters()).device)
+        with torch.no_grad():
+            with FlopCounterMode(display=False) as fm:
+                model(x)
+        return int(fm.get_total_flops())
+    except Exception:
+        return None
+    finally:
+        model.train(was_training)
 
 
 def make_tf(vocab, hidden=256, layers=3, heads=4):
@@ -371,9 +408,6 @@ def diagnose_internals(model, batch):
     }
 
 
-SEQ_LEN = 64  # fixed sequence length used by every loader in this harness
-
-
 def get_loaders(args, seed=0):
     print(f"Loading {args.dataset}...")
     if args.dataset == "wikitext":
@@ -465,18 +499,22 @@ def mode_think_scale(args):
             c.max_s = tsteps
         results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr)
         results["models"][name]["think_steps"] = tsteps
+        mf = measure_fwd_flops(m)
+        if mf:
+            results["models"][name]["measured_flops"] = mf
 
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
-    print(f"{'Config':12s} {'BestVal':>8s} {'Final':>8s} {'Params':>10s} {'~FLOPs':>12s}")
+    print(f"\n{'Config':12s} {'BestVal':>8s} {'Final':>8s} {'Params':>10s} {'~FLOPs':>12s}")
     losses = []
     for tsteps in [1, 2, 4, 8]:
         r = results["models"][f"v2_T{tsteps}"]
         losses.append(r["best_val_loss"])
+        mf = r.get("measured_flops") or r["approx_flops"]
         print(
             f"T={tsteps:<9d} {r['best_val_loss']:8.4f} {r['final_val_loss']:8.4f} "
-            f"{r['params']:10,} {r['approx_flops']:12,}"
+            f"{r['params']:10,} {mf:12,}"
         )
     improved = losses[-1] < losses[0]
     results["summary"] = {
@@ -550,20 +588,22 @@ def mode_verify_claim(args):
     wins = sum(1 for a, b in zip(tf_bests, v2_bests) if b < a)
     ps = paired_stats(v2_bests, tf_bests)
     results["summary"] = {
-        "tf_best_mean": round(tf_mean, 4),
-        "tf_best_std": round(tf_std, 4),
-        "v2_best_mean": round(v2_mean, 4),
-        "v2_best_std": round(v2_std, 4),
+        "tf_best_mean": round(statistics.mean(tf_bests), 4),
+        "tf_best_std": round(statistics.stdev(tf_bests), 4) if len(tf_bests) > 1 else 0.0,
+        "v2_best_mean": round(statistics.mean(v2_bests), 4),
+        "v2_best_std": round(statistics.stdev(v2_bests), 4) if len(v2_bests) > 1 else 0.0,
         **ps,
         "claim_holds": bool(wins >= (len(seeds) + 1) // 2 and v2_mean < tf_mean),
-        "stat_sig": bool(ps["n_seeds"] >= 3 and ps["p_value_paired_t"] < 0.05 and ps["delta_mean"] < 0),
+        "stat_sig": bool(ps["n_seeds"] >= 3 and ps["p_value_paired_t"] is not None
+                         and ps["p_value_paired_t"] < 0.05 and ps["delta_mean"] < 0),
     }
+    p_str = f"{ps['p_value_paired_t']:.4f}" if ps["p_value_paired_t"] is not None else "n/a"
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
     print(f"TF  best: {tf_mean:.4f} ± {tf_std:.4f}")
     print(f"V2  best: {v2_mean:.4f} ± {v2_std:.4f}")
-    print(f"Δ best (V2-TF): {ps['delta_mean']:+.4f} | p={ps['p_value_paired_t']:.4f}")
+    print(f"Δ best (V2-TF): {ps['delta_mean']:+.4f} | p={p_str}")
     print(f"V2 wins: {wins}/{len(seeds)} | claim_holds={results['summary']['claim_holds']} "
           f"| stat_sig={results['summary']['stat_sig']}")
     print("If claim_holds → next: equal-FLOPs curve, then scale 50M→1B.")
@@ -739,14 +779,16 @@ def paired_stats(v2_list, tf_list):
     d_sd = statistics.stdev(deltas) if n > 1 else 0.0
     t_stat = (d_mean / (d_sd / (n ** 0.5))) if n > 1 and d_sd > 0 else 0.0
     p_t = None
-    try:
-        from scipy import stats as sps
-        _, p_t = sps.ttest_rel(v2_list, tf_list)
-    except Exception:
-        pass
-    if p_t is None:
+    if n >= 2:
+        try:
+            from scipy import stats as sps
+            _, p_t = sps.ttest_rel(v2_list, tf_list)
+        except Exception:
+            p_t = None
+    if p_t is None or not math.isfinite(p_t):
         # normal approximation of the paired t (fine for n >= 5)
         p_t = 2 * (1 - 0.5 * (1 + math.erf(abs(t_stat) / (2 ** 0.5))))
+    p_t = round(p_t, 4) if math.isfinite(p_t) else None
     wins = sum(1 for d in deltas if d < 0)
     p_sign = sum(math.comb(n, k) * 0.5 ** n for k in range(wins, n + 1))  # one-sided binomial
     return {
@@ -755,7 +797,7 @@ def paired_stats(v2_list, tf_list):
         "delta_std": round(d_sd, 4),
         "cohens_d": round(d_mean / d_sd, 3) if d_sd > 0 else None,
         "t_stat": round(t_stat, 3),
-        "p_value_paired_t": round(p_t, 4),
+        "p_value_paired_t": p_t,
         "sign_test_p": round(p_sign, 4),
         "v2_wins": wins,
     }
@@ -773,19 +815,28 @@ def mode_equal_flops(args):
 
     tf_bests, v2_bests = [], []
     last_v2, vl = None, None
+    flops_method = "measured"
     for seed in seeds:
         torch.manual_seed(seed)
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
-        tf = make_tf(vocab)
-        v2 = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp)
-        f_tf = estimate_fwd_flops(tf)
-        f_v2 = estimate_fwd_flops(v2)
+        tf = make_tf(vocab, layers=args.tf_layers)
+        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp)
+        for c in v2.cells:
+            c.min_s = args.think_steps
+            c.max_s = args.think_steps
+        # Prefer profiler-measured FLOPs (hand-rolled counters proved unreliable).
+        f_tf = measure_fwd_flops(tf) or estimate_fwd_flops(tf)
+        f_v2 = measure_fwd_flops(v2) or estimate_fwd_flops(v2)
+        if f_tf is None or f_v2 is None:
+            flops_method = "estimate"
+        f_tf_est, f_v2_est = estimate_fwd_flops(tf), estimate_fwd_flops(v2)
         steps_tf = args.steps
         budget = steps_tf * f_tf
         steps_v2 = max(1, int(round(budget / max(f_v2, 1))))
-        print(f"\n--- seed {seed} | TF {steps_tf} steps | V2 {steps_v2} steps | FLOPs/step ratio={f_v2/f_tf:.2f}x ---")
+        print(f"\n--- seed {seed} | TF {steps_tf} steps | V2 {steps_v2} steps | "
+              f"FLOPs/step ratio={f_v2/f_tf:.2f}x ({flops_method}; est {f_v2_est/f_tf_est:.2f}x) ---")
         # No early stopping: both models consume the FULL budget (fair FLOPs race).
         tf_r = train_one(tf, tl, vl, steps_tf, f"TF_s{seed}", args.log_every,
                          early_stop_patience_steps=args.early_stop, lr=args.lr)
@@ -802,7 +853,8 @@ def mode_equal_flops(args):
             "steps_tf": steps_tf, "steps_v2": steps_v2,
             "tf_tokens": tf_r["tokens_seen"], "v2_tokens": v2_r["tokens_seen"],
             "tf_sec": tf_r["time_sec"], "v2_sec": v2_r["time_sec"],
-            "flops_ratio": round(f_v2 / f_tf, 3),
+            "flops_tf": f_tf, "flops_v2": f_v2, "flops_est_ratio": round(f_v2_est / f_tf_est, 3),
+            "think_steps": args.think_steps, "tf_layers": args.tf_layers,
         }
         tf_bests.append(tf_r["best_val_loss"])
         v2_bests.append(v2_r["best_val_loss"])
@@ -816,8 +868,10 @@ def mode_equal_flops(args):
         "v2_best_mean": round(statistics.mean(v2_bests), 4),
         "v2_best_std": round(statistics.stdev(v2_bests), 4) if len(v2_bests) > 1 else 0.0,
         **ps,
+        "flops_method": flops_method,
         "v2_wins_equal_flops": bool(ps["v2_wins"] >= (len(seeds) + 1) // 2 and ps["delta_mean"] < 0),
-        "stat_sig": bool(ps["n_seeds"] >= 3 and ps["p_value_paired_t"] < 0.05 and ps["delta_mean"] < 0),
+        "stat_sig": bool(ps["n_seeds"] >= 3 and ps["p_value_paired_t"] is not None
+                         and ps["p_value_paired_t"] < 0.05 and ps["delta_mean"] < 0),
     }
     if last_v2 is not None and vl is not None:
         batch = next(iter(vl))[0][:4]
@@ -826,13 +880,14 @@ def mode_equal_flops(args):
         print(f"\nLast-seed internals: iter_cos={d['iter_cosine_mean']} "
               f"mem_ent_ratio={d['memory_entropy_ratio']} top1={d['memory_top1_mass']} "
               f"eff_scale={d['mem_eff_scale_mean']}")
+    p_str = f"{ps['p_value_paired_t']:.4f}" if ps["p_value_paired_t"] is not None else "n/a"
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
     print(f"TF  best: {results['summary']['tf_best_mean']:.4f} ± {results['summary']['tf_best_std']:.4f}")
     print(f"V2  best: {results['summary']['v2_best_mean']:.4f} ± {results['summary']['v2_best_std']:.4f}")
     print(f"Δ best (V2-TF): {ps['delta_mean']:+.4f} ± {ps['delta_std']:.4f} | "
-          f"p={ps['p_value_paired_t']:.4f} (paired t) | sign p={ps['sign_test_p']:.4f}")
+          f"p={p_str} (paired t) | sign p={ps['sign_test_p']:.4f} | flops={flops_method}")
     print(f"V2 wins: {ps['v2_wins']}/{len(seeds)} | stat_sig={results['summary']['stat_sig']}")
     print("If V2 wins at equal FLOPs with p<0.05 across seeds → compute-efficiency claim is real.")
     _save(results, "equal_flops")
@@ -1066,6 +1121,10 @@ def main():
     p.add_argument("--warmup", type=float, default=0.02, help="warmup fraction of the token budget")
     p.add_argument("--early_stop", type=int, default=0,
                    help="early-stop patience in STEPS (0=off; equal_flops should stay 0 = full budget)")
+    p.add_argument("--think_steps", type=int, default=4,
+                   help="V2 think steps in equal_flops (thesis test: does more thinking beat TF at equal FLOPs?)")
+    p.add_argument("--tf_layers", type=int, default=3,
+                   help="Transformer layers in equal_flops (size the baseline to match V2 compute)")
     args = p.parse_args()
     if args.verify:
         verify()

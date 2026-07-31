@@ -56,6 +56,34 @@ RES_DIR.mkdir(parents=True, exist_ok=True)
 
 SEQ_LEN = 64  # fixed sequence length used by every loader in this harness
 
+# A placeholder token is WORSE than none (HF rejects it → DatasetNotFoundError).
+_hf_tok = os.environ.get("HF_TOKEN", "")
+if _hf_tok and len(_hf_tok) < 15:
+    print("WARNING: HF_TOKEN looks like a placeholder (too short). Remove it or set a real token")
+    print("         from https://huggingface.co/settings/tokens (read permission is enough).")
+
+
+def _hf_load(repo_id, config=None, split="train", streaming=False):
+    """load_dataset with one retry + clear guidance when the Hub rejects us.
+
+    Colab runs often fail with 'Dataset ... doesn't exist or cannot be accessed'
+    even though the repo is public — the real cause is auth/rate-limit/network.
+    """
+    from datasets import load_dataset
+    for attempt in (1, 2):
+        try:
+            if config:
+                return load_dataset(repo_id, config, split=split, streaming=streaming)
+            return load_dataset(repo_id, split=split, streaming=streaming)
+        except Exception as e:
+            if attempt == 1:
+                print(f"  HF load failed ({e.__class__.__name__}): {e}")
+                print("  Retrying in 10s... If it persists: set a real HF_TOKEN")
+                print("  (huggingface.co/settings/tokens) or check the network.")
+                time.sleep(10)
+            else:
+                raise
+
 
 def _word_vocab(texts, top_k=30000, seq_len=64, max_words=50):
     """Word-level vocab (same style as load_tinystories: first max_words per text)."""
@@ -81,8 +109,7 @@ def _texts_to_data(texts, w2i, seq_len=64, min_words=5):
 
 
 def load_tinystories(max_samples=5000, seq_len=64):
-    from datasets import load_dataset
-    ds = load_dataset("roneneldan/TinyStories", split="train")
+    ds = _hf_load("roneneldan/TinyStories", split="train")
     texts = ds["text"][:max_samples]
     w2i = _word_vocab(texts)
     data = _texts_to_data(texts, w2i, seq_len)
@@ -95,8 +122,7 @@ def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
     Note: HF moved the wikitext dataset to the Salesforce namespace; the bare
     repo id 'wikitext' fails on newer datasets versions (HfUriError).
     """
-    from datasets import load_dataset
-    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
+    ds = _hf_load("Salesforce/wikitext", config="wikitext-2-raw-v1", split="train")
     texts = [t.strip() for t in ds["text"] if len(t.strip()) > 5]
     if max_samples:
         texts = texts[:max_samples]
@@ -108,8 +134,7 @@ def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
 
 def load_openwebtext(max_samples=20000, seq_len=64, top_k=20000):
     """OpenWebText subset via streaming (downloads shards on the fly)."""
-    from datasets import load_dataset
-    ds = load_dataset("openwebtext", split="train", streaming=True)
+    ds = _hf_load("openwebtext", split="train", streaming=True)
     texts = []
     for ex in ds:
         t = ex["text"].strip()

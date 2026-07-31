@@ -6,9 +6,11 @@ Path: close small-scale gap → prove think-step scaling → then grow to 1B.
 
 Usage (Colab/RunPod — use ! in notebook cells):
   !python scale_path.py --verify
-  !python scale_path.py --mode diagnose --steps 1000     # memory + diversity fix check
+  !python scale_path.py --mode diagnose --steps 1000
   !python scale_path.py --mode verify_claim --steps 2000 --seeds 0,1,2
-  !python scale_path.py --mode think_scale --steps 800   # more steps ⇒ better?
+  !python scale_path.py --mode memory_ablation --steps 1500
+  !python scale_path.py --mode equal_flops --steps 2000 --samples 20000
+  !python scale_path.py --mode think_scale --steps 800
 
 Paste the RESULTS block back.
 """
@@ -447,6 +449,139 @@ def mode_verify_claim(args):
     return results
 
 
+def mode_memory_ablation(args):
+    """Does memory actually change loss? full vs zero-gate vs shuffled vs random slots."""
+    tl, vl, vocab = get_loaders(args)
+    print("\n=== MEMORY ABLATION ===")
+    print("If full≈zero≈random → memory unused. Want full << zero and full << random.")
+    m = make_tb(vocab, "hybrid_v2")
+    train_one(m, tl, vl, args.steps, "v2_train", args.log_every)
+    batch = next(iter(vl))[0][:4]
+    base_diag = diagnose_internals(m, batch)
+
+    # snapshot M0
+    m0_snap = [c.mem.M0.data.clone() for c in m.cells]
+    gate_snap = [c.mem.out_gate.data.clone() for c in m.cells]
+
+    def restore():
+        for c, s, g in zip(m.cells, m0_snap, gate_snap):
+            c.mem.M0.data.copy_(s)
+            c.mem.out_gate.data.copy_(g)
+
+    full = eval_loss(m, vl)
+
+    # zero read gate
+    for c in m.cells:
+        c.mem.out_gate.data.zero_()
+    zero = eval_loss(m, vl)
+    restore()
+
+    # shuffle slot order in M0
+    for c in m.cells:
+        perm = torch.randperm(c.mem.M0.size(0), device=c.mem.M0.device)
+        c.mem.M0.data.copy_(c.mem.M0.data[perm])
+    shuffled = eval_loss(m, vl)
+    restore()
+
+    # replace slots with fresh random (destroys learned content)
+    for c in m.cells:
+        c.mem.M0.data.normal_(0, 0.5)
+    random_m = eval_loss(m, vl)
+    restore()
+
+    results = {
+        "meta": _meta(args, "memory_ablation"),
+        "trained_best_proxy_final": round(full, 4),
+        "ablation": {
+            "full": round(full, 4),
+            "zero_out_gate": round(zero, 4),
+            "shuffled_slots": round(shuffled, 4),
+            "random_slots": round(random_m, 4),
+            "delta_zero": round(zero - full, 4),
+            "delta_shuffle": round(shuffled - full, 4),
+            "delta_random": round(random_m - full, 4),
+        },
+        "internals": base_diag,
+    }
+    useful = (zero - full) > 0.05 or (random_m - full) > 0.05
+    results["summary"] = {
+        "memory_useful": useful,
+        "verdict": "MEMORY_USED" if useful else "MEMORY_STILL_WEAK",
+    }
+
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    a = results["ablation"]
+    print(f"full            {a['full']:.4f}")
+    print(f"zero_out_gate   {a['zero_out_gate']:.4f}  (Δ={a['delta_zero']:+.4f})")
+    print(f"shuffled_slots  {a['shuffled_slots']:.4f}  (Δ={a['delta_shuffle']:+.4f})")
+    print(f"random_slots    {a['random_slots']:.4f}  (Δ={a['delta_random']:+.4f})")
+    print(f"internals: top1={base_diag['memory_top1_mass']} ent_ratio={base_diag['memory_entropy_ratio']} iter_cos={base_diag['iter_cosine_mean']}")
+    print(f"Verdict: {results['summary']['verdict']}")
+    _save(results, "memory_ablation")
+    return results
+
+
+def mode_equal_flops(args):
+    """Fair race: same total approx FLOPs budget (TF gets more steps if cheaper/step)."""
+    # Default to larger data to reduce memorization illusions
+    if args.samples < 15000:
+        print(f"NOTE: bumping samples {args.samples} → 20000 for equal_flops (less memorize).")
+        args.samples = 20000
+    tl, vl, vocab = get_loaders(args)
+    tf = make_tf(vocab)
+    v2 = make_tb(vocab, "hybrid_v2")
+    f_tf = estimate_fwd_flops(tf)
+    f_v2 = estimate_fwd_flops(v2)
+    # args.steps = Transformer steps; V2 steps scaled to match total FLOPs
+    steps_tf = args.steps
+    budget = steps_tf * f_tf
+    steps_v2 = max(1, int(round(budget / max(f_v2, 1))))
+    print("\n=== EQUAL FLOPs RACE ===")
+    print(f"FLOPs/step  TF={f_tf:,}  V2={f_v2:,}  ratio_v2/tf={f_v2/f_tf:.2f}x")
+    print(f"Steps       TF={steps_tf}  V2={steps_v2}  (matched budget ≈{budget:,})")
+
+    results = {"meta": _meta(args, "equal_flops"), "models": {}}
+    results["models"]["transformer"] = train_one(tf, tl, vl, steps_tf, "TF_eq", args.log_every)
+    results["models"]["hybrid_v2"] = train_one(v2, tl, vl, steps_v2, "V2_eq", max(50, args.log_every // 2))
+    results["models"]["transformer"]["steps_run"] = steps_tf
+    results["models"]["hybrid_v2"]["steps_run"] = steps_v2
+    results["models"]["transformer"]["total_flops"] = steps_tf * f_tf
+    results["models"]["hybrid_v2"]["total_flops"] = steps_v2 * f_v2
+
+    tf_b = results["models"]["transformer"]["best_val_loss"]
+    v2_b = results["models"]["hybrid_v2"]["best_val_loss"]
+    results["summary"] = {
+        "tf_best": tf_b,
+        "v2_best": v2_b,
+        "delta_best": round(v2_b - tf_b, 4),
+        "flops_ratio_per_step": round(f_v2 / f_tf, 3),
+        "v2_steps": steps_v2,
+        "tf_steps": steps_tf,
+        "v2_wins_equal_flops": v2_b < tf_b,
+        "note": "If V2 still wins at equal FLOPs on 20k data, compute-efficiency claim is real.",
+    }
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    print(f"{'Model':12s} {'Steps':>6s} {'BestVal':>8s} {'Final':>8s} {'TotFLOPs':>14s}")
+    for k in ["transformer", "hybrid_v2"]:
+        r = results["models"][k]
+        print(
+            f"{k:12s} {r['steps_run']:6d} {r['best_val_loss']:8.4f} {r['final_val_loss']:8.4f} "
+            f"{r['total_flops']:14,}"
+        )
+    print("-" * 64)
+    print(
+        f"Δ best (V2-TF)={results['summary']['delta_best']:+.4f} | "
+        f"v2_wins_equal_flops={results['summary']['v2_wins_equal_flops']}"
+    )
+    print(results["summary"]["note"])
+    _save(results, "equal_flops")
+    return results
+
+
 def _meta(args, mode):
     return {
         "mode": mode,
@@ -496,7 +631,7 @@ def main():
     p.add_argument("--verify", action="store_true")
     p.add_argument(
         "--mode",
-        choices=["race", "diagnose", "think_scale", "verify_claim"],
+        choices=["race", "diagnose", "think_scale", "verify_claim", "memory_ablation", "equal_flops"],
         default="race",
     )
     p.add_argument("--steps", type=int, default=2000)
@@ -508,14 +643,15 @@ def main():
     if args.verify:
         verify()
         return
-    if args.mode == "race":
-        mode_race(args)
-    elif args.mode == "diagnose":
-        mode_diagnose(args)
-    elif args.mode == "think_scale":
-        mode_think_scale(args)
-    else:
-        mode_verify_claim(args)
+    modes = {
+        "race": mode_race,
+        "diagnose": mode_diagnose,
+        "think_scale": mode_think_scale,
+        "verify_claim": mode_verify_claim,
+        "memory_ablation": mode_memory_ablation,
+        "equal_flops": mode_equal_flops,
+    }
+    modes[args.mode](args)
 
 
 if __name__ == "__main__":

@@ -1,41 +1,20 @@
-# RunPod / Colab — Path to 1B ≈ 600B+ feel (low cost)
+# RunPod / Colab — Path to low-cost 1B ≈ 600B+ feel
 
-## Goal
+## Honest status (after your latest runs)
 
-Others run 600B+ for quality (huge GPU bill).
-Your bet: **~1B params + more think-steps at inference** ≈ same feel, far lower train/run cost.
-
-Only valid if: quality scales with **T (think steps)**, not just params.
-
----
-
-## What the last results proved
-
-| Signal | Status |
+| Signal | Result |
 |--------|--------|
-| Hybrid v2 beats TF (even after TF overfit caveat) | strong |
-| T=1→8 lowers loss (COMPUTE_SCALES) | **core thesis alive** |
-| Memory was uniform (top1=1/16) | **bug — fixed now** |
-| iter_cos ≈ 0.99 | **wasted steps — diversity loss added** |
-| Report **best** val, not final (TF rose 3.94→4.71) | fixed in scripts |
+| claim_holds (3/3 seeds, best val) | **True** |
+| Memory selective? | **Yes** — top1≈0.22, ent_ratio≈0.80–0.84 (was uniform 0.0625) |
+| iter_cos | ~0.97 (was 0.99) — better, still room |
+| COMPUTE_SCALES T1→T8 | **stronger** (−1.89) |
+| V2 best ≈1.46 vs TF ≈3.93 | **suspicious** on 5k data — likely extra FLOPs + memorization |
 
-Fair re-read of your race (best, not final):
-- TF best ≈ **3.94** @800
-- V2 best ≈ **3.37** @1800  
-Still a real win, just not the fake −1.28 from TF collapse.
+Do **not** treat 1.46 as production quality yet. Next gates are fair.
 
 ---
 
-## Fixes just pushed
-
-1. **Selective memory write** — slots no longer all get the same mean vector
-2. **Sharp read** — learnable logit scale
-3. **Diversity aux loss** — penalize iter cosine > 0.95
-4. **best_val tracking** + **verify_claim** multi-seed
-
----
-
-## Run next (Colab: use `!`)
+## Run next (in order)
 
 ```python
 %cd tinybrain
@@ -43,38 +22,31 @@ Still a real win, just not the fake −1.28 from TF collapse.
 !python scale_path.py --verify
 ```
 
-**1) Did memory + diversity fix work?** (~10–20 min)
-
+### 1) Memory ablation — is memory causal?
 ```python
-!python scale_path.py --mode diagnose --steps 1000
+!python scale_path.py --mode memory_ablation --steps 1500
 ```
+Want: `MEMORY_USED` with Δ(zero−full) > 0.05
 
-Want: `top1 > 0.15`, `mem_entropy_ratio < 0.85`, `iter_cos < 0.98`
-
-**2) Does the win reproduce?** (~45–90 min, 3 seeds)
-
+### 2) Equal-FLOPs on more data — real efficiency claim
 ```python
-!python scale_path.py --mode verify_claim --steps 2000 --seeds 0,1,2
+!python scale_path.py --mode equal_flops --steps 2000 --samples 20000
 ```
+Auto-matches total FLOPs (V2 gets fewer steps because costlier/step).
+Want: `v2_wins_equal_flops=True` (even if margin shrinks)
 
-Want: `claim_holds=True` on **best** val
-
-**3) Re-check compute scaling after fixes**
-
-```python
-!python scale_path.py --mode think_scale --steps 800
-```
-
-Want: still `COMPUTE_SCALES`
-
-Paste each RESULTS block back.
+Paste both RESULTS blocks back.
 
 ---
 
-## After claim_holds
+## Then (only if both pass)
 
-1. Equal-FLOPs curve (same compute budget, not same steps)
-2. Scale 5M → 50M → 1B params
-3. Inference: raise T on hard tokens only (dynamic compute = cheap “600B feel”)
+1. Associative-recall / needle task (memory’s real job)
+2. Scale 5M → 50M → 1B
+3. Inference: raise T on hard tokens only → cheap “600B feel”
 
-Do **not** jump to 1B training until verify_claim passes.
+## Goal reminder
+
+600B companies pay for **params × FLOPs**.
+Your wedge: **small params + spend FLOPs as think-steps** when needed.
+That only ships if equal-FLOPs still wins and memory ablation shows MEMORY_USED.

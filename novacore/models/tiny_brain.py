@@ -51,6 +51,10 @@ class TinyBrainConfig:
     # Non-zero init so ThinkingStep / Memory can leave the dead zone
     gamma_init: float = 0.1
     out_gate_init: float = 0.1
+    # Penalize near-duplicate think iterations (push iter cosine down)
+    diversity_weight: float = 0.05
+    # Softplus(memory_sharp_init) / sqrt(d) — higher ⇒ sharper slot selection
+    memory_sharp_init: float = 5.0
 
 
 class ThinkingStep(nn.Module):
@@ -89,31 +93,55 @@ class ThinkingStep(nn.Module):
 
 
 class LearnedMemory(nn.Module):
+    """Content-addressable memory with selective per-slot writes.
+
+    Old bug: every slot was written the SAME mean value vector
+    (`vs.unsqueeze(1)`), so slots collapsed → uniform attn (top1=1/m).
+    Fix: address-weighted writes from token values + sharp read keys.
+    """
     def __init__(self, config):
         super().__init__()
         d, m = config.hidden_size, config.memory_slots
         self.ln = RMSNorm(d, config.layer_norm_eps)
         self.W_q = nn.Linear(d, d, bias=False)
+        self.W_k = nn.Linear(d, d, bias=False)
         self.W_v = nn.Linear(d, d, bias=False)
-        self.W_w = nn.Linear(d, m, bias=True)
-        self.W_e = nn.Linear(d, m, bias=True)
+        self.W_addr = nn.Linear(d, m, bias=True)
+        self.W_erase = nn.Linear(d, m, bias=True)
         self.W_i = nn.Linear(d, 1, bias=True)
-        self.M0 = nn.Parameter(torch.randn(m, d) * config.initializer_range)
+        self.M0 = nn.Parameter(torch.empty(m, d))
+        nn.init.orthogonal_(self.M0)
+        self.M0.data *= 0.5
         self.eta = config.memory_compress_rate
         self.out_gate = nn.Parameter(torch.tensor([config.out_gate_init]))
+        self.logit_scale = nn.Parameter(torch.tensor(float(config.memory_sharp_init)))
+        self._last_attn = None
+
     def forward(self, x, mem=None):
         B, S, d = x.shape
-        m = self.M0.shape[0]
         if mem is None:
-            mem = self.M0.unsqueeze(0).expand(B, -1, -1)
+            mem = self.M0.unsqueeze(0).expand(B, -1, -1).contiguous()
+        else:
+            mem = mem.contiguous()
+
+        scale = F.softplus(self.logit_scale) / math.sqrt(d)
         q = self.W_q(self.ln(x))
-        a = F.softmax(torch.bmm(q, mem.transpose(1,2)) / math.sqrt(d), dim=-1)
+        k = self.W_k(mem)
+        a = F.softmax(torch.bmm(q, k.transpose(1, 2)) * scale, dim=-1)
+        self._last_attn = a.detach()
         r = torch.bmm(a, mem)
+
+        # Selective write: different tokens → different slots (not mean broadcast)
         v = self.W_v(x)
-        gw = torch.sigmoid(self.W_w(x)).mean(dim=1)
-        ge = torch.sigmoid(self.W_e(x)).mean(dim=1)
-        vs = v.mean(dim=1)
-        mem = mem * (1 - ge.unsqueeze(-1)) + gw.unsqueeze(-1) * vs.unsqueeze(1)
+        addr = F.softmax(self.W_addr(x) * F.softplus(self.logit_scale), dim=-1)
+        erase = torch.sigmoid(self.W_erase(x))
+        write = torch.einsum("bsm,bsd->bmd", addr, v)
+        mass = addr.sum(dim=1).clamp_min(1e-6).unsqueeze(-1)
+        write = write / mass
+        erase_b = torch.einsum("bsm,bsm->bm", addr, erase).unsqueeze(-1)
+        erase_b = erase_b / mass
+        mem = mem * (1.0 - erase_b) + erase_b * write
+
         I = torch.sigmoid(self.W_i(mem))
         if self.training:
             mem = mem * (1 - (1 - I) * self.eta)
@@ -206,6 +234,7 @@ class AdaptiveThinkingCell(nn.Module):
         self.W_out.skip_init = True
         self.lc = config.confidence_penalty_weight
         self.ls = config.step_penalty_weight
+        self.ld = config.diversity_weight
 
     def forward(self, x, memory=None, return_trace: bool = False):
         x = self.W_in(x)
@@ -213,7 +242,9 @@ class AdaptiveThinkingCell(nn.Module):
             x = self.cell_attn(x)
         x0 = x
         steps, csum = 0, 0.0
+        div_pen = x.new_zeros(())
         trace = []
+        prev = None
         for t in range(self.max_s):
             x = self.think(x, step=t)
             r, memory = self.mem(x, memory)
@@ -221,6 +252,15 @@ class AdaptiveThinkingCell(nn.Module):
             steps += 1
             if return_trace:
                 trace.append(x.detach())
+            if self.training and prev is not None and self.ld > 0:
+                # Penalize only when consecutive states are nearly identical
+                cos = F.cosine_similarity(
+                    x.reshape(x.size(0), -1),
+                    prev.reshape(prev.size(0), -1),
+                    dim=-1,
+                ).mean()
+                div_pen = div_pen + F.relu(cos - 0.95)
+            prev = x
             c, h = self.conf(x, x0, t)
             csum += c.mean().item()
             if t >= self.min_s - 1:
@@ -231,6 +271,8 @@ class AdaptiveThinkingCell(nn.Module):
         if self.training:
             aux["conf"] = self.lc * (1 - csum / max(steps, 1))
             aux["step"] = self.ls * (steps / self.max_s) ** 2
+            if steps > 1 and self.ld > 0:
+                aux["div"] = self.ld * div_pen / max(steps - 1, 1)
         if return_trace:
             aux["trace"] = trace
         return out, memory, aux

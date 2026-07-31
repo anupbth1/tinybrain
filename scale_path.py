@@ -6,8 +6,8 @@ Path: close small-scale gap → prove think-step scaling → then grow to 1B.
 
 Usage (Colab/RunPod — use ! in notebook cells):
   !python scale_path.py --verify
-  !python scale_path.py --mode race --steps 2000          # TF vs v1 vs v2
-  !python scale_path.py --mode diagnose --steps 1000     # internals
+  !python scale_path.py --mode diagnose --steps 1000     # memory + diversity fix check
+  !python scale_path.py --mode verify_claim --steps 2000 --seeds 0,1,2
   !python scale_path.py --mode think_scale --steps 800   # more steps ⇒ better?
 
 Paste the RESULTS block back.
@@ -146,8 +146,8 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4):
     """
     variants:
       plain      — no attention
-      hybrid_v1  — post-cell lightweight attn (previous result)
-      hybrid_v2  — per-cell attn BEFORE think + step-conditioned + wider attn
+      hybrid_v1  — post-cell lightweight attn
+      hybrid_v2  — per-cell attn + step-conditioned + selective memory + diversity loss
     """
     if variant == "plain":
         use_post, every, ratio = False, False, 0.25
@@ -174,6 +174,8 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4):
         gamma_init=0.1,
         out_gate_init=0.1,
         step_penalty_weight=0.05 if variant == "hybrid_v2" else 0.1,
+        diversity_weight=0.05 if variant != "plain" else 0.0,
+        memory_sharp_init=5.0,
     )
     return TinyBrainModel(cfg).to(DEVICE)
 
@@ -181,6 +183,7 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4):
 def train_one(model, train_loader, val_loader, steps, name, log_every=200):
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
     hist, t0, step = [], time.time(), 0
+    best_val, best_step = float("inf"), 0
     model.train()
     while step < steps:
         for x, y in train_loader:
@@ -195,17 +198,27 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200):
             step += 1
             if step % log_every == 0 or step == steps:
                 vl = eval_loss(model, val_loader)
+                if vl < best_val:
+                    best_val, best_step = vl, step
                 gs = gate_stats(model) if not isinstance(model, NovaModel) else {}
-                row = {"step": step, "val_loss": round(vl, 4), "time_sec": round(time.time() - t0, 1), **gs}
+                row = {
+                    "step": step,
+                    "val_loss": round(vl, 4),
+                    "best_val_loss": round(best_val, 4),
+                    "time_sec": round(time.time() - t0, 1),
+                    **gs,
+                }
                 hist.append(row)
                 extra = f" | γ={gs.get('gamma_mean', 0):.4f} gate={gs.get('out_gate_mean', 0):.4f}" if gs else ""
-                print(f"  [{name:12s}] {step:4d}/{steps} | val={vl:.4f}{extra}")
+                print(f"  [{name:12s}] {step:4d}/{steps} | val={vl:.4f} best={best_val:.4f}{extra}")
                 model.train()
     return {
         "name": name,
         "params": count_params(model),
         "approx_flops": estimate_fwd_flops(model),
         "final_val_loss": hist[-1]["val_loss"] if hist else round(eval_loss(model, val_loader), 4),
+        "best_val_loss": round(best_val, 4),
+        "best_step": best_step,
         "time_sec": round(time.time() - t0, 2),
         "history": hist,
         "gates": gate_stats(model) if not isinstance(model, NovaModel) else {},
@@ -219,7 +232,6 @@ def diagnose_internals(model, batch):
     x = batch.to(DEVICE)
     h = model.embed(x)
     cell0 = model.cells[0]
-    # force full think steps for diversity measure
     old_min, old_max = cell0.min_s, cell0.max_s
     cell0.min_s = cell0.max_s = min(4, old_max)
     out, mem, aux = cell0(h, return_trace=True)
@@ -230,10 +242,9 @@ def diagnose_internals(model, batch):
         a = trace[i].reshape(-1)
         b = trace[i + 1].reshape(-1)
         sims.append(F.cosine_similarity(a, b, dim=0).item())
-    # memory attention entropy on last state
-    q = cell0.mem.W_q(cell0.mem.ln(out))
-    scores = torch.bmm(q, mem.transpose(1, 2)) / math.sqrt(out.size(-1))
-    attn = F.softmax(scores, dim=-1)
+    attn = cell0.mem._last_attn
+    if attn is None:
+        attn = torch.ones(out.size(0), out.size(1), mem.size(1), device=out.device) / mem.size(1)
     ent = -(attn * (attn + 1e-9).log()).sum(dim=-1).mean().item()
     max_ent = math.log(mem.size(1))
     top1 = attn.max(dim=-1).values.mean().item()
@@ -259,35 +270,36 @@ def get_loaders(args):
 
 
 def mode_race(args):
-    """TF vs hybrid_v1 vs hybrid_v2 — does v2 close the gap?"""
+    """TF vs hybrid_v1 vs hybrid_v2 — compare BEST val (TF can overfit late)."""
     tl, vl, vocab = get_loaders(args)
     results = {"meta": _meta(args, "race"), "models": {}}
     print("\n=== RACE: Transformer vs Hybrid v1 vs Hybrid v2 ===")
+    print("NOTE: report BEST val_loss (final can overfit, especially TF).")
     results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every)
     results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1"), tl, vl, args.steps, "hybrid_v1", args.log_every)
     results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2"), tl, vl, args.steps, "hybrid_v2", args.log_every)
 
-    tf_l = results["models"]["transformer"]["final_val_loss"]
+    tf_b = results["models"]["transformer"]["best_val_loss"]
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
-    print(f"{'Model':14s} {'Params':>10s} {'~FLOPs':>12s} {'ValLoss':>8s} {'ΔTF':>8s} {'Time':>7s}")
+    print(f"{'Model':14s} {'Params':>10s} {'BestVal':>8s} {'Final':>8s} {'Best@':>6s} {'ΔBestTF':>8s}")
     for k in ["transformer", "hybrid_v1", "hybrid_v2"]:
         r = results["models"][k]
         print(
-            f"{k:14s} {r['params']:10,} {r['approx_flops']:12,} "
-            f"{r['final_val_loss']:8.4f} {r['final_val_loss']-tf_l:+8.4f} {r['time_sec']:6.1f}s"
+            f"{k:14s} {r['params']:10,} {r['best_val_loss']:8.4f} {r['final_val_loss']:8.4f} "
+            f"{r['best_step']:6d} {r['best_val_loss']-tf_b:+8.4f}"
         )
-    v2 = results["models"]["hybrid_v2"]["final_val_loss"]
-    v1 = results["models"]["hybrid_v1"]["final_val_loss"]
+    v2b = results["models"]["hybrid_v2"]["best_val_loss"]
+    v1b = results["models"]["hybrid_v1"]["best_val_loss"]
     results["summary"] = {
-        "v2_vs_tf": round(v2 - tf_l, 4),
-        "v2_vs_v1": round(v2 - v1, 4),
-        "v2_beats_tf": v2 < tf_l,
-        "path_note": "If v2_vs_tf ≤ 0.10, proceed to think_scale. If not, widen attn / more steps.",
+        "v2_vs_tf_best": round(v2b - tf_b, 4),
+        "v2_vs_v1_best": round(v2b - v1b, 4),
+        "v2_beats_tf": v2b < tf_b,
+        "path_note": "Use best_val (not final). If v2 still wins → verify_claim multi-seed.",
     }
     print("-" * 64)
-    print(f"v2 vs TF: {results['summary']['v2_vs_tf']:+.4f} | v2 vs v1: {results['summary']['v2_vs_v1']:+.4f}")
+    print(f"v2 vs TF (best): {results['summary']['v2_vs_tf_best']:+.4f} | v2 vs v1 (best): {results['summary']['v2_vs_v1_best']:+.4f}")
     print(results["summary"]["path_note"])
     _save(results, "race")
     return results
@@ -297,7 +309,8 @@ def mode_diagnose(args):
     """Train briefly then measure iteration diversity + memory entropy."""
     tl, vl, vocab = get_loaders(args)
     results = {"meta": _meta(args, "diagnose"), "models": {}}
-    print("\n=== DIAGNOSE internals (v1 vs v2) ===")
+    print("\n=== DIAGNOSE internals (v1 vs v2) — after memory/diversity fix ===")
+    print("Targets: iter_cos < 0.98 | mem_entropy_ratio < 0.85 | top1 > 0.15")
     for variant in ["hybrid_v1", "hybrid_v2"]:
         m = make_tb(vocab, variant)
         train_one(m, tl, vl, args.steps, variant, args.log_every)
@@ -322,11 +335,10 @@ def mode_think_scale(args):
     tl, vl, vocab = get_loaders(args)
     results = {"meta": _meta(args, "think_scale"), "models": {}}
     print("\n=== THINK SCALE (fixed params, vary think steps) ===")
-    print("If more steps ⇒ lower loss, compute-scaling thesis is alive.")
+    print("If more steps ⇒ lower BEST loss, compute-scaling thesis is alive.")
     for tsteps in [1, 2, 4, 8]:
         name = f"v2_T{tsteps}"
         m = make_tb(vocab, "hybrid_v2", think_steps=tsteps)
-        # force using that many steps
         for c in m.cells:
             c.min_s = tsteps
             c.max_s = tsteps
@@ -336,24 +348,102 @@ def mode_think_scale(args):
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
-    print(f"{'Config':12s} {'ValLoss':>8s} {'Params':>10s} {'~FLOPs':>12s}")
+    print(f"{'Config':12s} {'BestVal':>8s} {'Final':>8s} {'Params':>10s} {'~FLOPs':>12s}")
     losses = []
     for tsteps in [1, 2, 4, 8]:
         r = results["models"][f"v2_T{tsteps}"]
-        losses.append(r["final_val_loss"])
-        print(f"T={tsteps:<9d} {r['final_val_loss']:8.4f} {r['params']:10,} {r['approx_flops']:12,}")
-    # monotonic-ish check
+        losses.append(r["best_val_loss"])
+        print(
+            f"T={tsteps:<9d} {r['best_val_loss']:8.4f} {r['final_val_loss']:8.4f} "
+            f"{r['params']:10,} {r['approx_flops']:12,}"
+        )
     improved = losses[-1] < losses[0]
     results["summary"] = {
-        "T1": losses[0],
-        "T8": losses[-1],
+        "T1_best": losses[0],
+        "T8_best": losses[-1],
         "T8_better_than_T1": improved,
         "delta_T8_minus_T1": round(losses[-1] - losses[0], 4),
         "verdict": "COMPUTE_SCALES" if improved else "STEPS_DONT_HELP_YET",
     }
     print("-" * 64)
-    print(f"Verdict: {results['summary']['verdict']} (T8-T1={results['summary']['delta_T8_minus_T1']:+.4f})")
+    print(f"Verdict: {results['summary']['verdict']} (T8-T1 best={results['summary']['delta_T8_minus_T1']:+.4f})")
     _save(results, "think_scale")
+    return results
+
+
+def mode_verify_claim(args):
+    """Multi-seed TF vs v2 using BEST val — kills leakage/overfit illusions."""
+    import statistics as stats
+
+    seeds = [int(s) for s in args.seeds.split(",")]
+    results = {"meta": _meta(args, "verify_claim"), "seeds": {}, "summary": {}}
+    print("\n=== VERIFY CLAIM (multi-seed, best val) ===")
+    print(f"seeds={seeds} steps={args.steps}")
+    print("Compares BEST val (TF often overfits after ~800–1000 steps).")
+    tf_bests, v2_bests = [], []
+    last_v2, last_batch = None, None
+
+    for seed in seeds:
+        torch.manual_seed(seed)
+        if DEVICE == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        tl, vl, vocab = get_loaders(args)
+        print(f"\n--- seed {seed} ---")
+        tf_m = make_tf(vocab)
+        v2_m = make_tb(vocab, "hybrid_v2")
+        tf_r = train_one(tf_m, tl, vl, args.steps, f"TF_s{seed}", args.log_every)
+        v2_r = train_one(v2_m, tl, vl, args.steps, f"V2_s{seed}", args.log_every)
+        last_v2, last_batch = v2_m, next(iter(vl))[0][:4]
+        delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
+        results["seeds"][str(seed)] = {
+            "transformer": {
+                "best": tf_r["best_val_loss"],
+                "final": tf_r["final_val_loss"],
+                "best_step": tf_r["best_step"],
+            },
+            "hybrid_v2": {
+                "best": v2_r["best_val_loss"],
+                "final": v2_r["final_val_loss"],
+                "best_step": v2_r["best_step"],
+            },
+            "delta_best": delta,
+        }
+        tf_bests.append(tf_r["best_val_loss"])
+        v2_bests.append(v2_r["best_val_loss"])
+        print(
+            f"  seed {seed}: TF best={tf_r['best_val_loss']:.4f} @{tf_r['best_step']} | "
+            f"V2 best={v2_r['best_val_loss']:.4f} @{v2_r['best_step']} | Δ={delta:+.4f}"
+        )
+
+    if last_v2 is not None and last_batch is not None:
+        results["last_seed_internals"] = diagnose_internals(last_v2, last_batch)
+        d = results["last_seed_internals"]
+        print(
+            f"\nLast-seed internals: iter_cos={d['iter_cosine_mean']} "
+            f"mem_ent_ratio={d['memory_entropy_ratio']} top1={d['memory_top1_mass']}"
+        )
+
+    tf_mean, v2_mean = stats.mean(tf_bests), stats.mean(v2_bests)
+    tf_std = stats.stdev(tf_bests) if len(tf_bests) > 1 else 0.0
+    v2_std = stats.stdev(v2_bests) if len(v2_bests) > 1 else 0.0
+    wins = sum(1 for a, b in zip(tf_bests, v2_bests) if b < a)
+    results["summary"] = {
+        "tf_best_mean": round(tf_mean, 4),
+        "tf_best_std": round(tf_std, 4),
+        "v2_best_mean": round(v2_mean, 4),
+        "v2_best_std": round(v2_std, 4),
+        "v2_wins": wins,
+        "n_seeds": len(seeds),
+        "claim_holds": bool(wins >= (len(seeds) + 1) // 2 and v2_mean < tf_mean),
+    }
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    print(f"TF  best: {tf_mean:.4f} ± {tf_std:.4f}")
+    print(f"V2  best: {v2_mean:.4f} ± {v2_std:.4f}")
+    print(f"V2 wins: {wins}/{len(seeds)} | claim_holds={results['summary']['claim_holds']}")
+    print("If claim_holds → next: equal-FLOPs curve, then scale 50M→1B.")
+    _save(results, "verify_claim")
     return results
 
 
@@ -367,6 +457,8 @@ def _meta(args, mode):
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "cuda_name": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None,
         "goal": "1B TinyBrain compute ≈ 600B+ Transformer feel",
+        "memory_fix": "selective slot write + sharp read",
+        "diversity_fix": "relu(cos-0.95) aux loss",
     }
 
 
@@ -390,17 +482,28 @@ def verify():
         out = m(x, labels=x)
         assert torch.isfinite(out["loss"]), name
         print(f"  OK {name:12s} params={count_params(m):,} loss={out['loss'].item():.4f}")
+    m = make_tb(vocab, "hybrid_v2", hidden=64, cells=1, think_steps=2)
+    with torch.no_grad():
+        _ = m(x, labels=x)
+        a = m.cells[0].mem._last_attn
+        top1 = a.max(dim=-1).values.mean().item() if a is not None else 0.0
+    print(f"  memory top1 mass (untrained)={top1:.4f} (uniform ~{1/16:.4f})")
     print("VERIFY PASS")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--verify", action="store_true")
-    p.add_argument("--mode", choices=["race", "diagnose", "think_scale"], default="race")
+    p.add_argument(
+        "--mode",
+        choices=["race", "diagnose", "think_scale", "verify_claim"],
+        default="race",
+    )
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--samples", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=200)
+    p.add_argument("--seeds", type=str, default="0,1,2", help="comma seeds for verify_claim")
     args = p.parse_args()
     if args.verify:
         verify()
@@ -409,8 +512,10 @@ def main():
         mode_race(args)
     elif args.mode == "diagnose":
         mode_diagnose(args)
-    else:
+    elif args.mode == "think_scale":
         mode_think_scale(args)
+    else:
+        mode_verify_claim(args)
 
 
 if __name__ == "__main__":

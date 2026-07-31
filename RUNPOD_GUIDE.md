@@ -1,81 +1,80 @@
-# RunPod / Colab — Scale Path (1B ≈ 600B+ feel)
+# RunPod / Colab — Path to 1B ≈ 600B+ feel (low cost)
 
-## Goal (honest framing)
+## Goal
 
-600B models win by **depth of mixing + knowledge capacity**.
-TinyBrain's bet: **params stay ~1B**, extra intelligence comes from
-**iterative think-steps + memory + light token mixing**.
+Others run 600B+ for quality (huge GPU bill).
+Your bet: **~1B params + more think-steps at inference** ≈ same feel, far lower train/run cost.
 
-That only works if:
-1. Small-scale quality matches Transformer (gap → ~0)
-2. **More think-steps ⇒ better loss** at fixed params (compute scaling)
-3. Then grow to 1B params with a large think budget
+Only valid if: quality scales with **T (think steps)**, not just params.
 
 ---
 
-## What just landed (Hybrid results)
+## What the last results proved
 
-| Model | ValLoss | Δ vs TF |
-|-------|---------|---------|
-| Transformer | 4.0663 | 0 |
-| TB-plain | 4.4287 | +0.36 |
-| TB-hybrid v1 | 4.2878 | +0.22 |
+| Signal | Status |
+|--------|--------|
+| Hybrid v2 beats TF (even after TF overfit caveat) | strong |
+| T=1→8 lowers loss (COMPUTE_SCALES) | **core thesis alive** |
+| Memory was uniform (top1=1/16) | **bug — fixed now** |
+| iter_cos ≈ 0.99 | **wasted steps — diversity loss added** |
+| Report **best** val, not final (TF rose 3.94→4.71) | fixed in scripts |
 
-Hybrid helps. Next: **v2** (attn before each cell + step-conditioned think).
+Fair re-read of your race (best, not final):
+- TF best ≈ **3.94** @800
+- V2 best ≈ **3.37** @1800  
+Still a real win, just not the fake −1.28 from TF collapse.
 
 ---
 
-## Colab / RunPod commands (use `!` in notebook)
+## Fixes just pushed
+
+1. **Selective memory write** — slots no longer all get the same mean vector
+2. **Sharp read** — learnable logit scale
+3. **Diversity aux loss** — penalize iter cosine > 0.95
+4. **best_val tracking** + **verify_claim** multi-seed
+
+---
+
+## Run next (Colab: use `!`)
 
 ```python
-!git clone https://github.com/anupbth1/tinybrain.git
 %cd tinybrain
-!pip install -q datasets
 !git pull
 !python scale_path.py --verify
 ```
 
-### Experiment order (run in order, paste RESULTS each time)
+**1) Did memory + diversity fix work?** (~10–20 min)
 
 ```python
-# 1) Close the gap? (~15-40 min GPU)
-!python scale_path.py --mode race --steps 2000
-
-# 2) Are iterations actually refining? (~10-20 min)
 !python scale_path.py --mode diagnose --steps 1000
+```
 
-# 3) Critical for 1B=600B: more think ⇒ better? (~20-40 min)
+Want: `top1 > 0.15`, `mem_entropy_ratio < 0.85`, `iter_cos < 0.98`
+
+**2) Does the win reproduce?** (~45–90 min, 3 seeds)
+
+```python
+!python scale_path.py --mode verify_claim --steps 2000 --seeds 0,1,2
+```
+
+Want: `claim_holds=True` on **best** val
+
+**3) Re-check compute scaling after fixes**
+
+```python
 !python scale_path.py --mode think_scale --steps 800
 ```
 
----
+Want: still `COMPUTE_SCALES`
 
-## Decision tree
-
-| Race result | Action |
-|-------------|--------|
-| v2 gap ≤ 0.10 vs TF | Go to think_scale |
-| v2 better than v1 but gap > 0.15 | Longer train (5k) or wider attn |
-| v2 ≤ v1 | Revert placement; try post+wider only |
-
-| think_scale result | Action |
-|--------------------|--------|
-| T8 < T1 (COMPUTE_SCALES) | Scale params toward 50M→1B |
-| T8 ≥ T1 | Fix iteration diversity before any scaling |
+Paste each RESULTS block back.
 
 ---
 
-## How 1B gets 600B+ *feel*
+## After claim_holds
 
-Not magic compression of weights. Mechanism:
+1. Equal-FLOPs curve (same compute budget, not same steps)
+2. Scale 5M → 50M → 1B params
+3. Inference: raise T on hard tokens only (dynamic compute = cheap “600B feel”)
 
-```
-Transformer 600B:  quality ≈ f(params, layers, data)
-TinyBrain 1B:      quality ≈ f(params, think_steps, memory, data)
-```
-
-If `∂quality/∂think_steps > 0`, you can spend FLOPs at inference
-like a deeper model without storing 600B weights.
-That is the only credible path to "1B feels like 600B+".
-
-Until think_scale says COMPUTE_SCALES, do **not** jump to 1B training.
+Do **not** jump to 1B training until verify_claim passes.

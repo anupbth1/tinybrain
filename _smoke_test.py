@@ -1,5 +1,6 @@
-"""Scratch: exercise full mode_memory_ablation + mode_equal_flops with stubbed loaders."""
+"""Scratch: exercise new paths — measured FLOPs, think_steps/tf_layers, n=1 stats."""
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -23,25 +24,29 @@ def fake_loaders(args, seed=0):
 
 sp.get_loaders = fake_loaders
 
-args = argparse.Namespace(seeds="0,1", steps=8, batch=8, samples=150, dataset="tinystories",
-                          log_every=4, memory_sharp=None, lr=1e-3, warmup=0.3, early_stop=0)
+# 1) measure_fwd_flops works and is finite
+tf = sp.make_tf(VOCAB)
+v2 = sp.make_tb(VOCAB, "hybrid_v2", think_steps=8)
+mf_tf = sp.measure_fwd_flops(tf)
+mf_v2 = sp.measure_fwd_flops(v2)
+print(f"measured flops tf={mf_tf:,} v2(T8)={mf_v2:,} ratio={mf_v2/mf_tf:.3f}")
+assert mf_tf and mf_v2 and math.isfinite(mf_tf) and math.isfinite(mf_v2)
 
-print("=========== MEMORY ABLATION ===========")
-r = sp.mode_memory_ablation(args)
-assert r["summary"]["verdict"] in ("MEMORY_USED READ_NO_SLOT_ID WRITE_NO_SLOT_ID",
-                                   "MEMORY_USED READ_NO_SLOT_ID WRITE_USES_SLOT_ID",
-                                   "MEMORY_USED READ_USES_SLOT_ID WRITE_NO_SLOT_ID",
-                                   "MEMORY_USED READ_USES_SLOT_ID WRITE_USES_SLOT_ID",
-                                   "MEMORY_STILL_WEAK"), r["summary"]["verdict"]
-assert set(r["per_seed"].keys()) == {"0", "1"}
-assert "ro_delta_shuf_vals" in r["ablation"]
-print("ablation verdict:", r["summary"]["verdict"])
+# 2) paired_stats with n=1 → finite p (1.0), no crash
+ps1 = sp.paired_stats([3.5], [3.2])
+print("n=1 stats:", ps1)
+assert ps1["p_value_paired_t"] == 1.0 and ps1["sign_test_p"] == 1.0
 
-print("\n=========== EQUAL FLOPS ===========")
-r2 = sp.mode_equal_flops(args)
-assert "stat_sig" in r2["summary"] and "p_value_paired_t" in r2["summary"]
-assert "tf_tokens" in r2["seeds"]["0"] and "v2_tokens" in r2["seeds"]["0"]
-assert "last_seed_internals" in r2 and "mem_eff_scale_mean" in r2["last_seed_internals"]
-print("equal_flops summary:", {k: v for k, v in r2["summary"].items() if k != "cohens_d"})
+# 3) equal_flops with think_steps/tf_layers via stubbed loaders
+args = argparse.Namespace(seeds="0", steps=8, batch=8, samples=150, dataset="tinystories",
+                          log_every=4, memory_sharp=None, lr=1e-3, warmup=0.3, early_stop=0,
+                          think_steps=8, tf_layers=3)
+r = sp.mode_equal_flops(args)
+seed0 = r["seeds"]["0"]
+assert seed0["think_steps"] == 8 and seed0["tf_layers"] == 3
+assert seed0["flops_tf"] > 0 and seed0["flops_v2"] > 0
+assert r["summary"]["p_value_paired_t"] == 1.0  # n=1 → p=1.0
+print("equal_flops(T8) summary ok:", r["summary"]["delta_mean"], "| wins:", r["summary"]["v2_wins"])
+print("FLOPs", seed0["flops_tf"], seed0["flops_v2"])
 
-print("\nMODE_SMOKE_OK")
+print("FIX_SMOKE_OK")

@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "mode": "equal_flops",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 20000,
+    "dataset": "tinystories",
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0",
+    "timestamp": "2026-07-31T08:03:38",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "seeds": {
+    "0": {
+      "tf_best": 3.1465,
+      "tf_final": 3.1465,
+      "v2_best": 3.1975,
+      "v2_final": 3.1975,
+      "delta_best": 0.051,
+      "delta_final": 0.051,
+      "tf_best_step": 2000,
+      "v2_best_step": 898,
+      "steps_tf": 2000,
+      "steps_v2": 898,
+      "tf_tokens": 4096000,
+      "v2_tokens": 1839104,
+      "tf_sec": 84.75,
+      "v2_sec": 109.51,
+      "flops_ratio": 2.227
+    }
+  },
+  "summary": {
+    "tf_best_mean": 3.1465,
+    "tf_best_std": 0.0,
+    "v2_best_mean": 3.1975,
+    "v2_best_std": 0.0,
+    "n_seeds": 1,
+    "delta_mean": 0.051,
+    "delta_std": 0.0,
+    "cohens_d": null,
+    "t_stat": 0.0,
+    "p_value_paired_t": NaN,
+    "sign_test_p": 1.0,
+    "v2_wins": 0,
+    "v2_wins_equal_flops": false,
+    "stat_sig": false
+  },
+  "last_seed_internals": {
+    "iter_cosine_mean": 0.9738,
+    "iter_cosine_list": [
+      0.9692,
+      0.9812,
+      0.9711
+    ],
+    "memory_entropy": 1.7643,
+    "memory_entropy_ratio": 0.6363,
+    "memory_top1_mass": 0.454,
+    "mem_logit_scale_mean": 5.0935,
+    "mem_eff_scale_mean": 0.3183,
+    "out_norm": 10.7466,
+    "embed_norm": 6.2674
+  }
+}

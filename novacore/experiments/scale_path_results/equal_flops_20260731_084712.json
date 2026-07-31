@@ -1,0 +1,103 @@
+{
+  "meta": {
+    "mode": "equal_flops",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 20000,
+    "dataset": "tinystories",
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0,1,2",
+    "timestamp": "2026-07-31T08:37:06",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "seeds": {
+    "0": {
+      "tf_best": 3.1465,
+      "tf_final": 3.1465,
+      "v2_best": 3.1199,
+      "v2_final": 3.1199,
+      "delta_best": -0.0266,
+      "delta_final": -0.0266,
+      "tf_best_step": 2000,
+      "v2_best_step": 898,
+      "steps_tf": 2000,
+      "steps_v2": 898,
+      "tf_tokens": 4096000,
+      "v2_tokens": 1839104,
+      "tf_sec": 89.24,
+      "v2_sec": 109.46,
+      "flops_ratio": 2.227
+    },
+    "1": {
+      "tf_best": 3.1596,
+      "tf_final": 3.1596,
+      "v2_best": 3.2202,
+      "v2_final": 3.2202,
+      "delta_best": 0.0606,
+      "delta_final": 0.0606,
+      "tf_best_step": 2000,
+      "v2_best_step": 898,
+      "steps_tf": 2000,
+      "steps_v2": 898,
+      "tf_tokens": 4096000,
+      "v2_tokens": 1839104,
+      "tf_sec": 89.06,
+      "v2_sec": 109.19,
+      "flops_ratio": 2.227
+    },
+    "2": {
+      "tf_best": 3.1519,
+      "tf_final": 3.1519,
+      "v2_best": 3.3215,
+      "v2_final": 3.3215,
+      "delta_best": 0.1696,
+      "delta_final": 0.1696,
+      "tf_best_step": 2000,
+      "v2_best_step": 898,
+      "steps_tf": 2000,
+      "steps_v2": 898,
+      "tf_tokens": 4096000,
+      "v2_tokens": 1839104,
+      "tf_sec": 89.08,
+      "v2_sec": 109.31,
+      "flops_ratio": 2.227
+    }
+  },
+  "summary": {
+    "tf_best_mean": 3.1527,
+    "tf_best_std": 0.0066,
+    "v2_best_mean": 3.2205,
+    "v2_best_std": 0.1008,
+    "n_seeds": 3,
+    "delta_mean": 0.0679,
+    "delta_std": 0.0983,
+    "cohens_d": 0.69,
+    "t_stat": 1.196,
+    "p_value_paired_t": 0.3543,
+    "sign_test_p": 0.875,
+    "v2_wins": 1,
+    "v2_wins_equal_flops": false,
+    "stat_sig": false
+  },
+  "last_seed_internals": {
+    "iter_cosine_mean": 0.9747,
+    "iter_cosine_list": [
+      0.9694,
+      0.9795,
+      0.9753
+    ],
+    "memory_entropy": 1.4576,
+    "memory_entropy_ratio": 0.5257,
+    "memory_top1_mass": 0.5359,
+    "mem_logit_scale_mean": 31.9925,
+    "mem_eff_scale_mean": 1.9995,
+    "out_norm": 10.8696,
+    "embed_norm": 6.3005
+  }
+}

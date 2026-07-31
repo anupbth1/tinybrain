@@ -1,0 +1,85 @@
+{
+  "meta": {
+    "mode": "memory_ablation",
+    "device": "cuda",
+    "steps": 1500,
+    "batch": 32,
+    "samples": 5000,
+    "dataset": "tinystories",
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0,1,2",
+    "timestamp": "2026-07-31T08:15:06",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "per_seed": {
+    "0": {
+      "full": 2.0038,
+      "zero": 15.3915,
+      "shuf_vals": 2.2836,
+      "shuf_keys": 2.4665,
+      "random": 7.9077,
+      "ro_full": 14.557,
+      "ro_shuf_vals": 14.6289,
+      "ro_random": 11.2913,
+      "ro_zero": 15.3914
+    },
+    "1": {
+      "full": 2.1558,
+      "zero": 16.6717,
+      "shuf_vals": 2.2452,
+      "shuf_keys": 2.3643,
+      "random": 8.4371,
+      "ro_full": 16.4764,
+      "ro_shuf_vals": 16.37,
+      "ro_random": 14.1708,
+      "ro_zero": 16.6714
+    },
+    "2": {
+      "full": 2.2844,
+      "zero": 16.3602,
+      "shuf_vals": 2.3941,
+      "shuf_keys": 2.848,
+      "random": 7.0011,
+      "ro_full": 15.7341,
+      "ro_shuf_vals": 16.0043,
+      "ro_random": 12.2143,
+      "ro_zero": 16.36
+    }
+  },
+  "ablation": {
+    "full": 2.148,
+    "zero_out_gate": 16.1411,
+    "shuffled_values": 2.3076,
+    "shuffled_keys": 2.5596,
+    "random_values": 7.782,
+    "read_only_full": 15.5892,
+    "read_only_shuffled_values": 15.6677,
+    "read_only_random": 12.5588,
+    "read_only_zero_gate": 16.141,
+    "delta_zero": 13.9931,
+    "delta_shuf_vals": 0.1596,
+    "delta_shuf_keys": 0.4116,
+    "delta_random": 5.634,
+    "ro_delta_shuf_vals": 0.0786,
+    "ro_delta_random": -3.0304,
+    "ro_delta_zero": 0.5518
+  },
+  "internals_mean": {
+    "iter_cosine_mean": 0.9701,
+    "memory_entropy_ratio": 0.6878,
+    "memory_top1_mass": 0.3759,
+    "mem_eff_scale_mean": 0.3231,
+    "mem_logit_scale_mean": 5.1694
+  },
+  "summary": {
+    "memory_useful": true,
+    "read_uses_slot_id": true,
+    "write_uses_slot_id": true,
+    "verdict": "MEMORY_USED READ_USES_SLOT_ID WRITE_USES_SLOT_ID"
+  }
+}

@@ -55,17 +55,28 @@ class TinyBrainConfig:
     diversity_weight: float = 0.05
     # Softplus(memory_sharp_init) / sqrt(d) — higher ⇒ sharper slot selection
     memory_sharp_init: float = 5.0
+    # Low-rank think branches (W_c/W_e1/W_e2 at rank r) — much cheaper thinking.
+    # None → full d×d branches (current behavior). r << d makes T8/T16 affordable
+    # at equal FLOPs and cuts the sequential think-loop cost for wall-clock.
+    think_rank: Optional[int] = None
 
 
 class ThinkingStep(nn.Module):
     def __init__(self, config):
         super().__init__()
         d = config.hidden_size
+        r = config.think_rank
         self.ln = RMSNorm(d, config.layer_norm_eps)
         self.W_o = nn.Linear(d, d, bias=False)
-        self.W_c = nn.Linear(d, d, bias=True)
-        self.W_e1 = nn.Linear(d, d, bias=False)
-        self.W_e2 = nn.Linear(d, d, bias=False)
+        if r is not None and 0 < r < d:
+            # Low-rank branches: each step costs ~4·d·r instead of ~4·d·d.
+            self.W_c = nn.Sequential(nn.Linear(d, r, bias=True), nn.Linear(r, d, bias=False))
+            self.W_e1 = nn.Sequential(nn.Linear(d, r, bias=False), nn.Linear(r, d, bias=False))
+            self.W_e2 = nn.Sequential(nn.Linear(d, r, bias=False), nn.Linear(r, d, bias=False))
+        else:
+            self.W_c = nn.Linear(d, d, bias=True)
+            self.W_e1 = nn.Linear(d, d, bias=False)
+            self.W_e2 = nn.Linear(d, d, bias=False)
         self.do = nn.Dropout(config.dropout)
         self.gamma = nn.Parameter(torch.tensor([config.gamma_init]))
         self.step_conditioned = config.step_conditioned_think

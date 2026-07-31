@@ -15,6 +15,8 @@ Usage (Colab/RunPod — use ! in notebook cells):
   !python scale_path.py --mode equal_flops --memory_sharp 32    # sharper slot read
   !python scale_path.py --mode equal_flops --think_steps 8      # thesis: more thinking vs TF
   !python scale_path.py --mode equal_flops --think_steps 8 --tf_layers 6   # V2-T8 vs bigger TF
+  !python scale_path.py --mode equal_flops --think_steps 8 --think_rank 32 # cheaper thinking
+  !python scale_path.py --mode equal_flops --ema 0.999           # EMA weights (overfitting defense)
 
 Fairness defaults: LR schedule keyed to TOKENS (warmup+cosine), equal-FLOPs
 compares BEST val with paired t-test/sign test over seeds, full budget per
@@ -119,11 +121,25 @@ def load_tinystories(max_samples=5000, seq_len=64):
 def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
     """WikiText-2 raw — out-of-distribution vs TinyStories (prose → encyclopedia).
 
-    Note: HF moved the wikitext dataset to the Salesforce namespace; the bare
-    repo id 'wikitext' fails on newer datasets versions (HfUriError).
+    Tries the HF Hub first; if the Hub is unreachable (common on Colab where
+    only cached datasets load), falls back to downloading the canonical
+    wikitext-2 zip from s3 and parsing the raw .tokens files directly.
     """
-    ds = _hf_load("Salesforce/wikitext", config="wikitext-2-raw-v1", split="train")
-    texts = [t.strip() for t in ds["text"] if len(t.strip()) > 5]
+    try:
+        ds = _hf_load("Salesforce/wikitext", config="wikitext-2-raw-v1", split="train")
+        texts = [t.strip() for t in ds["text"] if len(t.strip()) > 5]
+    except Exception:
+        print("  HF unreachable — downloading wikitext-2 zip directly")
+        import urllib.request
+        import zipfile
+        zpath = "wikitext-2-v1.zip"
+        if not os.path.exists(zpath):
+            urllib.request.urlretrieve(
+                "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip", zpath
+            )
+        with zipfile.ZipFile(zpath) as zf:
+            raw = zf.read("wikitext-2/wiki.train.tokens").decode()
+        texts = [t for t in raw.splitlines() if len(t.strip()) > 5]
     if max_samples:
         texts = texts[:max_samples]
     w2i = _word_vocab(texts, top_k=top_k)
@@ -257,7 +273,7 @@ def make_tf(vocab, hidden=256, layers=3, heads=4):
     return NovaModel(cfg).to(DEVICE)
 
 
-def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None):
+def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None, rank=None):
     """
     variants:
       plain      — no attention
@@ -291,19 +307,23 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, shar
         step_penalty_weight=0.05 if variant == "hybrid_v2" else 0.1,
         diversity_weight=0.05 if variant != "plain" else 0.0,
         memory_sharp_init=5.0 if sharp is None else sharp,
+        think_rank=rank,
     )
     return TinyBrainModel(cfg).to(DEVICE)
 
 
 def train_one(model, train_loader, val_loader, steps, name, log_every=200,
               use_cosine=True, early_stop_patience_steps=0, lr=3e-4,
-              warmup_fraction=0.02):
+              warmup_fraction=0.02, ema=0.0):
     """Train with an LR schedule keyed to TOKENS, not steps.
 
     Why tokens: in equal-FLOPs runs the two models get different step counts.
     Keying cosine + linear warmup to each model's own token budget means both
     models sit at the same LR phase for the same fraction of data seen — the
     step-count difference no longer biases the comparison.
+
+    ema>0: exponential moving average of weights; val loss is evaluated on the
+    EMA weights (standard overfitting defense, usually worth ~0.1-0.3 nats).
     """
     tok_per_step = train_loader.batch_size * SEQ_LEN
     total_tokens = steps * tok_per_step
@@ -322,6 +342,22 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     else:
         sched = None
+    ema_state = None
+    if ema > 0:
+        ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def eval_at(state_dict=None):
+        """Val loss on given weights (EMA) or live model; returns to train mode."""
+        if state_dict is not None:
+            saved = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            model.load_state_dict(state_dict)
+            vl = eval_loss(model, val_loader)
+            model.load_state_dict(saved)
+        else:
+            vl = eval_loss(model, val_loader)
+        model.train()
+        return vl
+
     hist, t0, step = [], time.time(), 0
     best_val, best_step = float("inf"), 0
     ema_loss, best_train_ema, lr_at_best = None, None, None
@@ -339,11 +375,15 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
             opt.step()
             if sched is not None:
                 sched.step()
+            if ema > 0 and ema_state is not None:
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        ema_state[k].mul_(ema).add_(v, alpha=1.0 - ema)
             step += 1
             lv = loss.item()
             ema_loss = lv if ema_loss is None else 0.9 * ema_loss + 0.1 * lv
             if step % log_every == 0 or step == steps:
-                vl = eval_loss(model, val_loader)
+                vl = eval_at(ema_state if ema > 0 else None)
                 if vl < best_val - 1e-4:
                     best_val, best_step = vl, step
                     best_train_ema, lr_at_best = ema_loss, opt.param_groups[0]["lr"]
@@ -360,7 +400,6 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
                 hist.append(row)
                 extra = f" | γ={gs.get('gamma_mean', 0):.4f} gate={gs.get('out_gate_mean', 0):.4f}" if gs else ""
                 print(f"  [{name:12s}] {step:4d}/{steps} | val={vl:.4f} best={best_val:.4f} train={ema_loss:.4f}{extra}")
-                model.train()
                 if early_stop_patience_steps > 0 and step - best_step >= early_stop_patience_steps:
                     print(f"  [{name:12s}] early stop @ {step} (no improve for {step - best_step} steps)")
                     stopped_early = True
@@ -375,6 +414,7 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
         "final_val_loss": hist[-1]["val_loss"] if hist else round(eval_loss(model, val_loader), 4),
         "best_val_loss": round(best_val, 4),
         "best_step": best_step,
+        "ema": ema,
         "best_train_loss_ema": round(best_train_ema, 4) if best_train_ema is not None else None,
         "final_train_loss_ema": round(ema_loss, 4) if ema_loss is not None else None,
         "train_val_gap_at_best": round(best_train_ema - best_val, 4) if best_train_ema is not None else None,
@@ -455,9 +495,9 @@ def mode_race(args):
     results = {"meta": _meta(args, "race"), "models": {}}
     print("\n=== RACE: Transformer vs Hybrid v1 vs Hybrid v2 ===")
     print("NOTE: report BEST val_loss (final can overfit, especially TF).")
-    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr)
-    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr)
-    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr)
+    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema)
+    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema)
+    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema)
 
     tf_b = results["models"]["transformer"]["best_val_loss"]
     print("\n" + "=" * 64)
@@ -492,8 +532,8 @@ def mode_diagnose(args):
     print("\n=== DIAGNOSE internals (v1 vs v2) — after memory/diversity fix ===")
     print("Targets: iter_cos < 0.98 | mem_entropy_ratio < 0.85 | top1 > 0.15")
     for variant in ["hybrid_v1", "hybrid_v2"]:
-        m = make_tb(vocab, variant, sharp=args.memory_sharp)
-        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr)
+        m = make_tb(vocab, variant, sharp=args.memory_sharp, rank=args.think_rank)
+        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema)
         batch = next(iter(vl))[0][:4]
         diag = diagnose_internals(m, batch)
         results["models"][variant] = {
@@ -518,11 +558,11 @@ def mode_think_scale(args):
     print("If more steps ⇒ lower BEST loss, compute-scaling thesis is alive.")
     for tsteps in [1, 2, 4, 8]:
         name = f"v2_T{tsteps}"
-        m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp)
+        m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp, rank=args.think_rank)
         for c in m.cells:
             c.min_s = tsteps
             c.max_s = tsteps
-        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr)
+        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema)
         results["models"][name]["think_steps"] = tsteps
         mf = measure_fwd_flops(m)
         if mf:
@@ -572,11 +612,11 @@ def mode_verify_claim(args):
         tl, vl, vocab = get_loaders(args, seed)
         print(f"\n--- seed {seed} ---")
         tf_m = make_tf(vocab)
-        v2_m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp)
+        v2_m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank)
         tf_r = train_one(tf_m, tl, vl, args.steps, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
         v2_r = train_one(v2_m, tl, vl, args.steps, f"V2_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
         last_v2, last_batch = v2_m, next(iter(vl))[0][:4]
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -659,9 +699,9 @@ def mode_memory_ablation(args):
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
-        m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp)
+        m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank)
         train_one(m, tl, vl, args.steps, f"v2_s{seed}", args.log_every,
-                  early_stop_patience_steps=args.log_every * 4, lr=args.lr)
+                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema)
         batch = next(iter(vl))[0][:4]
         internals_all.append(diagnose_internals(m, batch))
 
@@ -847,7 +887,7 @@ def mode_equal_flops(args):
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
         tf = make_tf(vocab, layers=args.tf_layers)
-        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp)
+        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp, rank=args.think_rank)
         for c in v2.cells:
             c.min_s = args.think_steps
             c.max_s = args.think_steps
@@ -864,9 +904,9 @@ def mode_equal_flops(args):
               f"FLOPs/step ratio={f_v2/f_tf:.2f}x ({flops_method}; est {f_v2_est/f_tf_est:.2f}x) ---")
         # No early stopping: both models consume the FULL budget (fair FLOPs race).
         tf_r = train_one(tf, tl, vl, steps_tf, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
         v2_r = train_one(v2, tl, vl, steps_v2, f"V2_s{seed}", max(50, args.log_every // 2),
-                         early_stop_patience_steps=args.early_stop, lr=args.lr)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
         last_v2 = v2
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -1054,7 +1094,7 @@ def mode_assoc_recall(args):
 
     results = {"meta": _meta(args, "assoc_recall"), "models": {}}
     results["models"]["transformer"] = train_assoc(make_tf(vocab), "TF")
-    results["models"]["hybrid_v2"] = train_assoc(make_tb(vocab, "hybrid_v2"), "V2")
+    results["models"]["hybrid_v2"] = train_assoc(make_tb(vocab, "hybrid_v2", rank=args.think_rank), "V2")
     tf_a = results["models"]["transformer"]["best"]["acc"]
     v2_a = results["models"]["hybrid_v2"]["best"]["acc"]
     results["summary"] = {
@@ -1150,6 +1190,10 @@ def main():
                    help="V2 think steps in equal_flops (thesis test: does more thinking beat TF at equal FLOPs?)")
     p.add_argument("--tf_layers", type=int, default=3,
                    help="Transformer layers in equal_flops (size the baseline to match V2 compute)")
+    p.add_argument("--think_rank", type=int, default=None,
+                   help="low-rank think branches (r < hidden_size) — much cheaper thinking; None = full d×d (default)")
+    p.add_argument("--ema", type=float, default=0.0,
+                   help="EMA decay for weights (0=off; 0.999 typical). Val is evaluated on EMA weights.")
     args = p.parse_args()
     if args.verify:
         verify()

@@ -1,0 +1,197 @@
+{
+  "meta": {
+    "mode": "equal_flops",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 20000,
+    "timestamp": "2026-07-31T06:17:14",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss"
+  },
+  "models": {
+    "transformer": {
+      "name": "TF_eq",
+      "params": 6625792,
+      "approx_flops": 138412032,
+      "final_val_loss": 2.9251,
+      "best_val_loss": 2.9251,
+      "best_step": 2000,
+      "time_sec": 91.94,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.259,
+          "best_val_loss": 4.259,
+          "time_sec": 9.3
+        },
+        {
+          "step": 400,
+          "val_loss": 3.8157,
+          "best_val_loss": 3.8157,
+          "time_sec": 18.3
+        },
+        {
+          "step": 600,
+          "val_loss": 3.5702,
+          "best_val_loss": 3.5702,
+          "time_sec": 27.9
+        },
+        {
+          "step": 800,
+          "val_loss": 3.4145,
+          "best_val_loss": 3.4145,
+          "time_sec": 38.0
+        },
+        {
+          "step": 1000,
+          "val_loss": 3.2783,
+          "best_val_loss": 3.2783,
+          "time_sec": 47.4
+        },
+        {
+          "step": 1200,
+          "val_loss": 3.1796,
+          "best_val_loss": 3.1796,
+          "time_sec": 56.3
+        },
+        {
+          "step": 1400,
+          "val_loss": 3.1011,
+          "best_val_loss": 3.1011,
+          "time_sec": 65.2
+        },
+        {
+          "step": 1600,
+          "val_loss": 3.0128,
+          "best_val_loss": 3.0128,
+          "time_sec": 74.1
+        },
+        {
+          "step": 1800,
+          "val_loss": 2.9713,
+          "best_val_loss": 2.9713,
+          "time_sec": 83.0
+        },
+        {
+          "step": 2000,
+          "val_loss": 2.9251,
+          "best_val_loss": 2.9251,
+          "time_sec": 91.9
+        }
+      ],
+      "gates": {},
+      "steps_run": 2000,
+      "total_flops": 276824064000
+    },
+    "hybrid_v2": {
+      "name": "V2_eq",
+      "params": 7206001,
+      "approx_flops": 283115520,
+      "final_val_loss": 2.4976,
+      "best_val_loss": 2.4635,
+      "best_step": 900,
+      "time_sec": 128.82,
+      "history": [
+        {
+          "step": 100,
+          "val_loss": 5.5334,
+          "best_val_loss": 5.5334,
+          "time_sec": 13.2,
+          "gamma_mean": 0.1063,
+          "out_gate_mean": 0.1047
+        },
+        {
+          "step": 200,
+          "val_loss": 4.6726,
+          "best_val_loss": 4.6726,
+          "time_sec": 26.3,
+          "gamma_mean": 0.1031,
+          "out_gate_mean": 0.1091
+        },
+        {
+          "step": 300,
+          "val_loss": 4.2958,
+          "best_val_loss": 4.2958,
+          "time_sec": 39.4,
+          "gamma_mean": 0.1025,
+          "out_gate_mean": 0.1169
+        },
+        {
+          "step": 400,
+          "val_loss": 4.0373,
+          "best_val_loss": 4.0373,
+          "time_sec": 52.5,
+          "gamma_mean": 0.1034,
+          "out_gate_mean": 0.1278
+        },
+        {
+          "step": 500,
+          "val_loss": 3.8207,
+          "best_val_loss": 3.8207,
+          "time_sec": 65.8,
+          "gamma_mean": 0.105,
+          "out_gate_mean": 0.1407
+        },
+        {
+          "step": 600,
+          "val_loss": 3.574,
+          "best_val_loss": 3.574,
+          "time_sec": 78.9,
+          "gamma_mean": 0.1054,
+          "out_gate_mean": 0.1557
+        },
+        {
+          "step": 700,
+          "val_loss": 3.2685,
+          "best_val_loss": 3.2685,
+          "time_sec": 92.1,
+          "gamma_mean": 0.1071,
+          "out_gate_mean": 0.1709
+        },
+        {
+          "step": 800,
+          "val_loss": 2.8682,
+          "best_val_loss": 2.8682,
+          "time_sec": 105.3,
+          "gamma_mean": 0.1091,
+          "out_gate_mean": 0.1878
+        },
+        {
+          "step": 900,
+          "val_loss": 2.4635,
+          "best_val_loss": 2.4635,
+          "time_sec": 118.4,
+          "gamma_mean": 0.1137,
+          "out_gate_mean": 0.2001
+        },
+        {
+          "step": 978,
+          "val_loss": 2.4976,
+          "best_val_loss": 2.4635,
+          "time_sec": 128.8,
+          "gamma_mean": 0.119,
+          "out_gate_mean": 0.2049
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.119,
+        "out_gate_mean": 0.2049
+      },
+      "steps_run": 978,
+      "total_flops": 276886978560
+    }
+  },
+  "summary": {
+    "tf_best": 2.9251,
+    "v2_best": 2.4635,
+    "delta_best": -0.4616,
+    "flops_ratio_per_step": 2.045,
+    "v2_steps": 978,
+    "tf_steps": 2000,
+    "v2_wins_equal_flops": true,
+    "note": "If V2 still wins at equal FLOPs on 20k data, compute-efficiency claim is real."
+  }
+}

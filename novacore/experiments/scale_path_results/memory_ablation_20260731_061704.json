@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "mode": "memory_ablation",
+    "device": "cuda",
+    "steps": 1500,
+    "batch": 32,
+    "samples": 5000,
+    "timestamp": "2026-07-31T06:17:04",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss"
+  },
+  "trained_best_proxy_final": 2.5719,
+  "ablation": {
+    "full": 2.5719,
+    "zero_out_gate": 17.2229,
+    "shuffled_slots": 2.555,
+    "random_slots": 7.1892,
+    "delta_zero": 14.6509,
+    "delta_shuffle": -0.0169,
+    "delta_random": 4.6173
+  },
+  "internals": {
+    "iter_cosine_mean": 0.9547,
+    "iter_cosine_list": [
+      0.9581,
+      0.9398,
+      0.9663
+    ],
+    "memory_entropy": 1.7109,
+    "memory_entropy_ratio": 0.6171,
+    "memory_top1_mass": 0.4603,
+    "out_norm": 21.1593,
+    "embed_norm": 6.6924
+  },
+  "summary": {
+    "memory_useful": true,
+    "verdict": "MEMORY_USED"
+  }
+}

@@ -39,3 +39,5 @@ novacore/experiments/results/*.json
 # Temp
 *.tmp
 temp/
+# Editor
+.zed/

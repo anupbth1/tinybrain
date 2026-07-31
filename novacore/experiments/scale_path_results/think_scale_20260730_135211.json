@@ -1,0 +1,189 @@
+{
+  "meta": {
+    "mode": "think_scale",
+    "device": "cuda",
+    "steps": 800,
+    "batch": 32,
+    "samples": 5000,
+    "timestamp": "2026-07-30T13:48:01",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel"
+  },
+  "models": {
+    "v2_T1": {
+      "name": "v2_T1",
+      "params": 5083246,
+      "approx_flops": 89653248,
+      "final_val_loss": 4.1689,
+      "time_sec": 31.66,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.9936,
+          "time_sec": 8.2,
+          "gamma_mean": 0.1064,
+          "out_gate_mean": 0.1051
+        },
+        {
+          "step": 400,
+          "val_loss": 4.4207,
+          "time_sec": 15.8,
+          "gamma_mean": 0.1067,
+          "out_gate_mean": 0.1072
+        },
+        {
+          "step": 600,
+          "val_loss": 4.2578,
+          "time_sec": 23.7,
+          "gamma_mean": 0.1078,
+          "out_gate_mean": 0.1092
+        },
+        {
+          "step": 800,
+          "val_loss": 4.1689,
+          "time_sec": 31.7,
+          "gamma_mean": 0.1092,
+          "out_gate_mean": 0.1111
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1092,
+        "out_gate_mean": 0.1111
+      },
+      "think_steps": 1
+    },
+    "v2_T2": {
+      "name": "v2_T2",
+      "params": 5085550,
+      "approx_flops": 154140672,
+      "final_val_loss": 3.9986,
+      "time_sec": 41.79,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.9414,
+          "time_sec": 10.3,
+          "gamma_mean": 0.1054,
+          "out_gate_mean": 0.1105
+        },
+        {
+          "step": 400,
+          "val_loss": 4.3894,
+          "time_sec": 20.8,
+          "gamma_mean": 0.1068,
+          "out_gate_mean": 0.1515
+        },
+        {
+          "step": 600,
+          "val_loss": 4.1516,
+          "time_sec": 31.3,
+          "gamma_mean": 0.107,
+          "out_gate_mean": 0.1904
+        },
+        {
+          "step": 800,
+          "val_loss": 3.9986,
+          "time_sec": 41.8,
+          "gamma_mean": 0.1086,
+          "out_gate_mean": 0.2222
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1086,
+        "out_gate_mean": 0.2222
+      },
+      "think_steps": 2
+    },
+    "v2_T4": {
+      "name": "v2_T4",
+      "params": 5090158,
+      "approx_flops": 283115520,
+      "final_val_loss": 3.8373,
+      "time_sec": 64.67,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.9307,
+          "time_sec": 15.9,
+          "gamma_mean": 0.1057,
+          "out_gate_mean": 0.1079
+        },
+        {
+          "step": 400,
+          "val_loss": 4.3195,
+          "time_sec": 32.5,
+          "gamma_mean": 0.1049,
+          "out_gate_mean": 0.1266
+        },
+        {
+          "step": 600,
+          "val_loss": 4.0559,
+          "time_sec": 48.7,
+          "gamma_mean": 0.1063,
+          "out_gate_mean": 0.1503
+        },
+        {
+          "step": 800,
+          "val_loss": 3.8373,
+          "time_sec": 64.7,
+          "gamma_mean": 0.1089,
+          "out_gate_mean": 0.1717
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1089,
+        "out_gate_mean": 0.1717
+      },
+      "think_steps": 4
+    },
+    "v2_T8": {
+      "name": "v2_T8",
+      "params": 5099374,
+      "approx_flops": 541065216,
+      "final_val_loss": 3.7115,
+      "time_sec": 110.2,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.8155,
+          "time_sec": 27.5,
+          "gamma_mean": 0.1029,
+          "out_gate_mean": 0.1058
+        },
+        {
+          "step": 400,
+          "val_loss": 4.1989,
+          "time_sec": 55.3,
+          "gamma_mean": 0.103,
+          "out_gate_mean": 0.1191
+        },
+        {
+          "step": 600,
+          "val_loss": 3.9274,
+          "time_sec": 83.0,
+          "gamma_mean": 0.1065,
+          "out_gate_mean": 0.1331
+        },
+        {
+          "step": 800,
+          "val_loss": 3.7115,
+          "time_sec": 110.2,
+          "gamma_mean": 0.1096,
+          "out_gate_mean": 0.1437
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1096,
+        "out_gate_mean": 0.1437
+      },
+      "think_steps": 8
+    }
+  },
+  "summary": {
+    "T1": 4.1689,
+    "T8": 3.7115,
+    "T8_better_than_T1": true,
+    "delta_T8_minus_T1": -0.4574,
+    "verdict": "COMPUTE_SCALES"
+  }
+}

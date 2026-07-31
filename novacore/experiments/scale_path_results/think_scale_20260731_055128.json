@@ -1,0 +1,215 @@
+{
+  "meta": {
+    "mode": "think_scale",
+    "device": "cuda",
+    "steps": 800,
+    "batch": 32,
+    "samples": 5000,
+    "timestamp": "2026-07-31T05:46:02",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss"
+  },
+  "models": {
+    "v2_T1": {
+      "name": "v2_T1",
+      "params": 5279857,
+      "approx_flops": 89653248,
+      "final_val_loss": 4.1466,
+      "best_val_loss": 4.1466,
+      "best_step": 800,
+      "time_sec": 34.86,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.927,
+          "best_val_loss": 4.927,
+          "time_sec": 9.3,
+          "gamma_mean": 0.1066,
+          "out_gate_mean": 0.1058
+        },
+        {
+          "step": 400,
+          "val_loss": 4.4315,
+          "best_val_loss": 4.4315,
+          "time_sec": 17.9,
+          "gamma_mean": 0.1047,
+          "out_gate_mean": 0.1074
+        },
+        {
+          "step": 600,
+          "val_loss": 4.2428,
+          "best_val_loss": 4.2428,
+          "time_sec": 26.3,
+          "gamma_mean": 0.1049,
+          "out_gate_mean": 0.1092
+        },
+        {
+          "step": 800,
+          "val_loss": 4.1466,
+          "best_val_loss": 4.1466,
+          "time_sec": 34.9,
+          "gamma_mean": 0.1057,
+          "out_gate_mean": 0.1106
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1057,
+        "out_gate_mean": 0.1106
+      },
+      "think_steps": 1
+    },
+    "v2_T2": {
+      "name": "v2_T2",
+      "params": 5282161,
+      "approx_flops": 154140672,
+      "final_val_loss": 3.9647,
+      "best_val_loss": 3.9647,
+      "best_step": 800,
+      "time_sec": 49.45,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.9486,
+          "best_val_loss": 4.9486,
+          "time_sec": 12.5,
+          "gamma_mean": 0.1062,
+          "out_gate_mean": 0.1137
+        },
+        {
+          "step": 400,
+          "val_loss": 4.4161,
+          "best_val_loss": 4.4161,
+          "time_sec": 24.9,
+          "gamma_mean": 0.1047,
+          "out_gate_mean": 0.1454
+        },
+        {
+          "step": 600,
+          "val_loss": 4.1766,
+          "best_val_loss": 4.1766,
+          "time_sec": 37.2,
+          "gamma_mean": 0.1057,
+          "out_gate_mean": 0.1846
+        },
+        {
+          "step": 800,
+          "val_loss": 3.9647,
+          "best_val_loss": 3.9647,
+          "time_sec": 49.5,
+          "gamma_mean": 0.1068,
+          "out_gate_mean": 0.222
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1068,
+        "out_gate_mean": 0.222
+      },
+      "think_steps": 2
+    },
+    "v2_T4": {
+      "name": "v2_T4",
+      "params": 5286769,
+      "approx_flops": 283115520,
+      "final_val_loss": 3.3336,
+      "best_val_loss": 3.3336,
+      "best_step": 800,
+      "time_sec": 84.04,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.8676,
+          "best_val_loss": 4.8676,
+          "time_sec": 21.6,
+          "gamma_mean": 0.1035,
+          "out_gate_mean": 0.1108
+        },
+        {
+          "step": 400,
+          "val_loss": 4.3082,
+          "best_val_loss": 4.3082,
+          "time_sec": 41.9,
+          "gamma_mean": 0.1023,
+          "out_gate_mean": 0.1317
+        },
+        {
+          "step": 600,
+          "val_loss": 3.9703,
+          "best_val_loss": 3.9703,
+          "time_sec": 62.9,
+          "gamma_mean": 0.1037,
+          "out_gate_mean": 0.1588
+        },
+        {
+          "step": 800,
+          "val_loss": 3.3336,
+          "best_val_loss": 3.3336,
+          "time_sec": 84.0,
+          "gamma_mean": 0.1069,
+          "out_gate_mean": 0.1892
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1069,
+        "out_gate_mean": 0.1892
+      },
+      "think_steps": 4
+    },
+    "v2_T8": {
+      "name": "v2_T8",
+      "params": 5295985,
+      "approx_flops": 541065216,
+      "final_val_loss": 2.2606,
+      "best_val_loss": 2.2606,
+      "best_step": 800,
+      "time_sec": 155.51,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.885,
+          "best_val_loss": 4.885,
+          "time_sec": 39.2,
+          "gamma_mean": 0.1031,
+          "out_gate_mean": 0.1053
+        },
+        {
+          "step": 400,
+          "val_loss": 4.2414,
+          "best_val_loss": 4.2414,
+          "time_sec": 78.0,
+          "gamma_mean": 0.1031,
+          "out_gate_mean": 0.1185
+        },
+        {
+          "step": 600,
+          "val_loss": 3.5396,
+          "best_val_loss": 3.5396,
+          "time_sec": 116.6,
+          "gamma_mean": 0.1052,
+          "out_gate_mean": 0.1423
+        },
+        {
+          "step": 800,
+          "val_loss": 2.2606,
+          "best_val_loss": 2.2606,
+          "time_sec": 155.5,
+          "gamma_mean": 0.1126,
+          "out_gate_mean": 0.1653
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1126,
+        "out_gate_mean": 0.1653
+      },
+      "think_steps": 8
+    }
+  },
+  "summary": {
+    "T1_best": 4.1466,
+    "T8_best": 2.2606,
+    "T8_better_than_T1": true,
+    "delta_T8_minus_T1": -1.886,
+    "verdict": "COMPUTE_SCALES"
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "meta": {
+    "device": "cuda",
+    "steps": 500,
+    "batch": 32,
+    "vocab": 10698,
+    "n_seqs": 5000,
+    "data": "tinystories",
+    "timestamp": "2026-07-30T13:29:07",
+    "cuda_name": "Tesla T4"
+  },
+  "models": {
+    "transformer": {
+      "name": "Transformer",
+      "params": 4706560,
+      "final_val_loss": 4.0663,
+      "time_sec": 13.33,
+      "history": [
+        {
+          "step": 100,
+          "val_loss": 5.0379,
+          "time_sec": 3.2
+        },
+        {
+          "step": 200,
+          "val_loss": 4.5222,
+          "time_sec": 5.7
+        },
+        {
+          "step": 300,
+          "val_loss": 4.2959,
+          "time_sec": 8.2
+        },
+        {
+          "step": 400,
+          "val_loss": 4.157,
+          "time_sec": 10.8
+        },
+        {
+          "step": 500,
+          "val_loss": 4.0663,
+          "time_sec": 13.3
+        }
+      ],
+      "gates": {}
+    },
+    "tinybrain_plain": {
+      "name": "TB-plain",
+      "params": 4692334,
+      "final_val_loss": 4.4287,
+      "time_sec": 36.12,
+      "history": [
+        {
+          "step": 100,
+          "val_loss": 5.2749,
+          "time_sec": 7.4,
+          "gamma_mean": 0.1056,
+          "out_gate_mean": 0.1054
+        },
+        {
+          "step": 200,
+          "val_loss": 4.7543,
+          "time_sec": 14.9,
+          "gamma_mean": 0.1046,
+          "out_gate_mean": 0.1084
+        },
+        {
+          "step": 300,
+          "val_loss": 4.5761,
+          "time_sec": 21.7,
+          "gamma_mean": 0.1037,
+          "out_gate_mean": 0.1144
+        },
+        {
+          "step": 400,
+          "val_loss": 4.4766,
+          "time_sec": 29.2,
+          "gamma_mean": 0.1028,
+          "out_gate_mean": 0.1217
+        },
+        {
+          "step": 500,
+          "val_loss": 4.4287,
+          "time_sec": 36.1,
+          "gamma_mean": 0.1011,
+          "out_gate_mean": 0.1294
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1011,
+        "out_gate_mean": 0.1294
+      }
+    },
+    "tinybrain_hybrid": {
+      "name": "TB-hybrid",
+      "params": 4758126,
+      "final_val_loss": 4.2878,
+      "time_sec": 37.58,
+      "history": [
+        {
+          "step": 100,
+          "val_loss": 5.3107,
+          "time_sec": 7.7,
+          "gamma_mean": 0.1066,
+          "out_gate_mean": 0.1046
+        },
+        {
+          "step": 200,
+          "val_loss": 4.6893,
+          "time_sec": 15.2,
+          "gamma_mean": 0.1056,
+          "out_gate_mean": 0.11
+        },
+        {
+          "step": 300,
+          "val_loss": 4.4817,
+          "time_sec": 22.6,
+          "gamma_mean": 0.1049,
+          "out_gate_mean": 0.1173
+        },
+        {
+          "step": 400,
+          "val_loss": 4.3714,
+          "time_sec": 30.3,
+          "gamma_mean": 0.1038,
+          "out_gate_mean": 0.1244
+        },
+        {
+          "step": 500,
+          "val_loss": 4.2878,
+          "time_sec": 37.6,
+          "gamma_mean": 0.1019,
+          "out_gate_mean": 0.1314
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1019,
+        "out_gate_mean": 0.1314
+      }
+    }
+  },
+  "summary": {
+    "transformer_val_loss": 4.0663,
+    "plain_val_loss": 4.4287,
+    "hybrid_val_loss": 4.2878,
+    "hybrid_vs_transformer": 0.2215,
+    "hybrid_vs_plain": -0.1409,
+    "hybrid_beats_transformer": false,
+    "hybrid_beats_plain": true
+  }
+}

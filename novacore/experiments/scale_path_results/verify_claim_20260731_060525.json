@@ -1,0 +1,77 @@
+{
+  "meta": {
+    "mode": "verify_claim",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 5000,
+    "timestamp": "2026-07-31T05:51:31",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss"
+  },
+  "seeds": {
+    "0": {
+      "transformer": {
+        "best": 3.9346,
+        "final": 4.6881,
+        "best_step": 800
+      },
+      "hybrid_v2": {
+        "best": 1.3363,
+        "final": 1.3807,
+        "best_step": 1800
+      },
+      "delta_best": -2.5983
+    },
+    "1": {
+      "transformer": {
+        "best": 3.9447,
+        "final": 4.7361,
+        "best_step": 800
+      },
+      "hybrid_v2": {
+        "best": 1.6627,
+        "final": 1.9828,
+        "best_step": 1600
+      },
+      "delta_best": -2.282
+    },
+    "2": {
+      "transformer": {
+        "best": 3.9254,
+        "final": 4.6239,
+        "best_step": 800
+      },
+      "hybrid_v2": {
+        "best": 1.3818,
+        "final": 1.8375,
+        "best_step": 1800
+      },
+      "delta_best": -2.5436
+    }
+  },
+  "summary": {
+    "tf_best_mean": 3.9349,
+    "tf_best_std": 0.0097,
+    "v2_best_mean": 1.4603,
+    "v2_best_std": 0.1768,
+    "v2_wins": 3,
+    "n_seeds": 3,
+    "claim_holds": true
+  },
+  "last_seed_internals": {
+    "iter_cosine_mean": 0.9654,
+    "iter_cosine_list": [
+      0.9721,
+      0.9621,
+      0.9621
+    ],
+    "memory_entropy": 2.2121,
+    "memory_entropy_ratio": 0.7979,
+    "memory_top1_mass": 0.2192,
+    "out_norm": 23.457,
+    "embed_norm": 6.7687
+  }
+}

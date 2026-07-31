@@ -93,22 +93,25 @@ class ThinkingStep(nn.Module):
 
 
 class LearnedMemory(nn.Module):
-    """Content-addressable memory with selective per-slot writes.
+    """Slot memory with FIXED keys + writable values.
 
-    Old bug: every slot was written the SAME mean value vector
-    (`vs.unsqueeze(1)`), so slots collapsed → uniform attn (top1=1/m).
-    Fix: address-weighted writes from token values + sharp read keys.
+    Why keys≠values: if addressing uses W_k(mem), shuffling slots is an
+    isomorphism (permute keys+values together) → shuffle≈full ablation.
+    Fixed keys make slot identity matter; shuffling values alone should hurt.
     """
     def __init__(self, config):
         super().__init__()
         d, m = config.hidden_size, config.memory_slots
         self.ln = RMSNorm(d, config.layer_norm_eps)
         self.W_q = nn.Linear(d, d, bias=False)
-        self.W_k = nn.Linear(d, d, bias=False)
         self.W_v = nn.Linear(d, d, bias=False)
-        self.W_addr = nn.Linear(d, m, bias=True)
         self.W_erase = nn.Linear(d, m, bias=True)
         self.W_i = nn.Linear(d, 1, bias=True)
+        # Fixed addressing keys (not overwritten during forward)
+        self.keys = nn.Parameter(torch.empty(m, d))
+        nn.init.orthogonal_(self.keys)
+        self.keys.data *= 0.5
+        # Writable values
         self.M0 = nn.Parameter(torch.empty(m, d))
         nn.init.orthogonal_(self.M0)
         self.M0.data *= 0.5
@@ -116,6 +119,9 @@ class LearnedMemory(nn.Module):
         self.out_gate = nn.Parameter(torch.tensor([config.out_gate_init]))
         self.logit_scale = nn.Parameter(torch.tensor(float(config.memory_sharp_init)))
         self._last_attn = None
+        # Eval-time ablation switch: if True, skip the write path entirely so
+        # memory stays frozen at M0 (isolates the READ path in ablations).
+        self.read_only = False
 
     def forward(self, x, mem=None):
         B, S, d = x.shape
@@ -126,27 +132,27 @@ class LearnedMemory(nn.Module):
 
         scale = F.softplus(self.logit_scale) / math.sqrt(d)
         q = self.W_q(self.ln(x))
-        k = self.W_k(mem)
-        a = F.softmax(torch.bmm(q, k.transpose(1, 2)) * scale, dim=-1)
+        k = self.keys.unsqueeze(0).expand(B, -1, -1)
+        scores = torch.bmm(q, k.transpose(1, 2)) * scale
+        a = F.softmax(scores, dim=-1)
         self._last_attn = a.detach()
         r = torch.bmm(a, mem)
 
-        # Selective write: different tokens → different slots (not mean broadcast)
-        v = self.W_v(x)
-        addr = F.softmax(self.W_addr(x) * F.softplus(self.logit_scale), dim=-1)
-        erase = torch.sigmoid(self.W_erase(x))
-        write = torch.einsum("bsm,bsd->bmd", addr, v)
-        mass = addr.sum(dim=1).clamp_min(1e-6).unsqueeze(-1)
-        write = write / mass
-        erase_b = torch.einsum("bsm,bsm->bm", addr, erase).unsqueeze(-1)
-        erase_b = erase_b / mass
-        mem = mem * (1.0 - erase_b) + erase_b * write
+        if not self.read_only:
+            # Write to the same addressed slots (key-based), not a separate W_addr head
+            v = self.W_v(x)
+            erase = torch.sigmoid(self.W_erase(x))
+            write = torch.einsum("bsm,bsd->bmd", a, v)
+            mass = a.sum(dim=1).clamp_min(1e-6).unsqueeze(-1)
+            write = write / mass
+            erase_b = torch.einsum("bsm,bsm->bm", a, erase).unsqueeze(-1) / mass
+            mem = mem * (1.0 - erase_b) + erase_b * write
 
-        I = torch.sigmoid(self.W_i(mem))
-        if self.training:
-            mem = mem * (1 - (1 - I) * self.eta)
-        else:
-            mem = mem * (I > 0.1).float()
+            I = torch.sigmoid(self.W_i(mem))
+            if self.training:
+                mem = mem * (1 - (1 - I) * self.eta)
+            else:
+                mem = mem * (I > 0.1).float()
         r_gated = torch.tanh(self.out_gate) * r
         return r_gated, mem
 

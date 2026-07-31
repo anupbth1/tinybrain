@@ -1,0 +1,54 @@
+{
+  "meta": {
+    "mode": "diagnose",
+    "device": "cuda",
+    "steps": 1000,
+    "batch": 32,
+    "samples": 5000,
+    "timestamp": "2026-07-30T13:45:14",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel"
+  },
+  "models": {
+    "hybrid_v1": {
+      "val_loss": 4.1308983117341995,
+      "gates": {
+        "gamma_mean": 0.0905,
+        "out_gate_mean": 0.1701
+      },
+      "internals": {
+        "iter_cosine_mean": 0.9972,
+        "iter_cosine_list": [
+          0.9971,
+          0.9971,
+          0.9973
+        ],
+        "memory_entropy": 2.7726,
+        "memory_entropy_ratio": 1.0,
+        "memory_top1_mass": 0.0627,
+        "out_norm": 8.3097,
+        "embed_norm": 6.4803
+      }
+    },
+    "hybrid_v2": {
+      "val_loss": 3.8057529032230377,
+      "gates": {
+        "gamma_mean": 0.1114,
+        "out_gate_mean": 0.1852
+      },
+      "internals": {
+        "iter_cosine_mean": 0.99,
+        "iter_cosine_list": [
+          0.9892,
+          0.9898,
+          0.991
+        ],
+        "memory_entropy": 2.7726,
+        "memory_entropy_ratio": 1.0,
+        "memory_top1_mass": 0.0627,
+        "out_norm": 11.0096,
+        "embed_norm": 6.4995
+      }
+    }
+  }
+}

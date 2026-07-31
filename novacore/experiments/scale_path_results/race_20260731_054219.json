@@ -1,0 +1,284 @@
+{
+  "meta": {
+    "mode": "race",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 5000,
+    "timestamp": "2026-07-31T05:34:23",
+    "cuda_name": "Tesla T4",
+    "goal": "1B TinyBrain compute \u2248 600B+ Transformer feel",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss"
+  },
+  "models": {
+    "transformer": {
+      "name": "Transformer",
+      "params": 4706560,
+      "approx_flops": 138412032,
+      "final_val_loss": 4.6661,
+      "best_val_loss": 3.9418,
+      "best_step": 800,
+      "time_sec": 58.8,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.5376,
+          "best_val_loss": 4.5376,
+          "time_sec": 5.8
+        },
+        {
+          "step": 400,
+          "val_loss": 4.1538,
+          "best_val_loss": 4.1538,
+          "time_sec": 11.2
+        },
+        {
+          "step": 600,
+          "val_loss": 4.0122,
+          "best_val_loss": 4.0122,
+          "time_sec": 16.7
+        },
+        {
+          "step": 800,
+          "val_loss": 3.9418,
+          "best_val_loss": 3.9418,
+          "time_sec": 22.2
+        },
+        {
+          "step": 1000,
+          "val_loss": 3.9504,
+          "best_val_loss": 3.9418,
+          "time_sec": 27.9
+        },
+        {
+          "step": 1200,
+          "val_loss": 4.0368,
+          "best_val_loss": 3.9418,
+          "time_sec": 33.7
+        },
+        {
+          "step": 1400,
+          "val_loss": 4.1134,
+          "best_val_loss": 3.9418,
+          "time_sec": 39.7
+        },
+        {
+          "step": 1600,
+          "val_loss": 4.3244,
+          "best_val_loss": 3.9418,
+          "time_sec": 45.9
+        },
+        {
+          "step": 1800,
+          "val_loss": 4.4904,
+          "best_val_loss": 3.9418,
+          "time_sec": 52.3
+        },
+        {
+          "step": 2000,
+          "val_loss": 4.6661,
+          "best_val_loss": 3.9418,
+          "time_sec": 58.8
+        }
+      ],
+      "gates": {}
+    },
+    "hybrid_v1": {
+      "name": "hybrid_v1",
+      "params": 4958577,
+      "approx_flops": 262144000,
+      "final_val_loss": 3.7524,
+      "best_val_loss": 3.7026,
+      "best_step": 1800,
+      "time_sec": 199.7,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.6799,
+          "best_val_loss": 4.6799,
+          "time_sec": 21.3,
+          "gamma_mean": 0.1044,
+          "out_gate_mean": 0.1098
+        },
+        {
+          "step": 400,
+          "val_loss": 4.3513,
+          "best_val_loss": 4.3513,
+          "time_sec": 41.3,
+          "gamma_mean": 0.1048,
+          "out_gate_mean": 0.1235
+        },
+        {
+          "step": 600,
+          "val_loss": 4.2372,
+          "best_val_loss": 4.2372,
+          "time_sec": 60.7,
+          "gamma_mean": 0.1064,
+          "out_gate_mean": 0.1383
+        },
+        {
+          "step": 800,
+          "val_loss": 4.1285,
+          "best_val_loss": 4.1285,
+          "time_sec": 80.9,
+          "gamma_mean": 0.108,
+          "out_gate_mean": 0.1557
+        },
+        {
+          "step": 1000,
+          "val_loss": 4.0649,
+          "best_val_loss": 4.0649,
+          "time_sec": 100.2,
+          "gamma_mean": 0.1088,
+          "out_gate_mean": 0.1742
+        },
+        {
+          "step": 1200,
+          "val_loss": 3.9729,
+          "best_val_loss": 3.9729,
+          "time_sec": 120.4,
+          "gamma_mean": 0.1088,
+          "out_gate_mean": 0.1902
+        },
+        {
+          "step": 1400,
+          "val_loss": 3.8459,
+          "best_val_loss": 3.8459,
+          "time_sec": 139.8,
+          "gamma_mean": 0.1085,
+          "out_gate_mean": 0.2037
+        },
+        {
+          "step": 1600,
+          "val_loss": 3.8169,
+          "best_val_loss": 3.8169,
+          "time_sec": 159.8,
+          "gamma_mean": 0.1088,
+          "out_gate_mean": 0.2146
+        },
+        {
+          "step": 1800,
+          "val_loss": 3.7026,
+          "best_val_loss": 3.7026,
+          "time_sec": 179.9,
+          "gamma_mean": 0.1077,
+          "out_gate_mean": 0.2246
+        },
+        {
+          "step": 2000,
+          "val_loss": 3.7524,
+          "best_val_loss": 3.7026,
+          "time_sec": 199.7,
+          "gamma_mean": 0.1068,
+          "out_gate_mean": 0.2341
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1068,
+        "out_gate_mean": 0.2341
+      }
+    },
+    "hybrid_v2": {
+      "name": "hybrid_v2",
+      "params": 5286769,
+      "approx_flops": 283115520,
+      "final_val_loss": 2.8082,
+      "best_val_loss": 2.3579,
+      "best_step": 1800,
+      "time_sec": 210.68,
+      "history": [
+        {
+          "step": 200,
+          "val_loss": 4.8878,
+          "best_val_loss": 4.8878,
+          "time_sec": 21.3,
+          "gamma_mean": 0.1042,
+          "out_gate_mean": 0.1093
+        },
+        {
+          "step": 400,
+          "val_loss": 4.2914,
+          "best_val_loss": 4.2914,
+          "time_sec": 41.7,
+          "gamma_mean": 0.1029,
+          "out_gate_mean": 0.1272
+        },
+        {
+          "step": 600,
+          "val_loss": 3.9606,
+          "best_val_loss": 3.9606,
+          "time_sec": 63.0,
+          "gamma_mean": 0.104,
+          "out_gate_mean": 0.1532
+        },
+        {
+          "step": 800,
+          "val_loss": 3.1578,
+          "best_val_loss": 3.1578,
+          "time_sec": 84.2,
+          "gamma_mean": 0.1082,
+          "out_gate_mean": 0.1872
+        },
+        {
+          "step": 1000,
+          "val_loss": 2.6805,
+          "best_val_loss": 2.6805,
+          "time_sec": 104.8,
+          "gamma_mean": 0.1187,
+          "out_gate_mean": 0.2067
+        },
+        {
+          "step": 1200,
+          "val_loss": 2.7561,
+          "best_val_loss": 2.6805,
+          "time_sec": 125.8,
+          "gamma_mean": 0.1248,
+          "out_gate_mean": 0.216
+        },
+        {
+          "step": 1400,
+          "val_loss": 3.0816,
+          "best_val_loss": 2.6805,
+          "time_sec": 146.9,
+          "gamma_mean": 0.1293,
+          "out_gate_mean": 0.2222
+        },
+        {
+          "step": 1600,
+          "val_loss": 2.6419,
+          "best_val_loss": 2.6419,
+          "time_sec": 167.3,
+          "gamma_mean": 0.1333,
+          "out_gate_mean": 0.2272
+        },
+        {
+          "step": 1800,
+          "val_loss": 2.3579,
+          "best_val_loss": 2.3579,
+          "time_sec": 189.5,
+          "gamma_mean": 0.136,
+          "out_gate_mean": 0.2306
+        },
+        {
+          "step": 2000,
+          "val_loss": 2.8082,
+          "best_val_loss": 2.3579,
+          "time_sec": 210.7,
+          "gamma_mean": 0.1386,
+          "out_gate_mean": 0.2342
+        }
+      ],
+      "gates": {
+        "gamma_mean": 0.1386,
+        "out_gate_mean": 0.2342
+      }
+    }
+  },
+  "summary": {
+    "v2_vs_tf_best": -1.5839,
+    "v2_vs_v1_best": -1.3447,
+    "v2_beats_tf": true,
+    "path_note": "Use best_val (not final). If v2 still wins \u2192 verify_claim multi-seed."
+  }
+}

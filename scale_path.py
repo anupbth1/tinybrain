@@ -67,6 +67,8 @@ RES_DIR.mkdir(parents=True, exist_ok=True)
 # for training). Shrinks the V2 wall-clock gap vs the transformer.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# Reduce CUDA fragmentation in generation (big (B, L, vocab) logits).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SEQ_LEN = 64  # fixed sequence length used by every loader in this harness
 
@@ -497,11 +499,18 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
     think steps, late training runs expensive ones (wall-clock cut, same quality).
     """
     if compile:
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print(f"  [{name:12s}] torch.compile active")
-        except Exception as e:
-            print(f"  [{name:12s}] torch.compile unavailable: {e}")
+        orig_mod = getattr(model, "_orig_mod", model)
+        if isinstance(orig_mod, TinyBrainModel):
+            # TinyBrain's python control flow (confidence .item() breaks, grad
+            # mode switches) makes torch.compile recompile constantly — slower,
+            # not faster. Keep it eager; compile only helps the transformer.
+            print(f"  [{name:12s}] compile skipped for TinyBrain (graph breaks)")
+        else:
+            try:
+                model = _force_compile(model)
+                print(f"  [{name:12s}] torch.compile active")
+            except Exception as e:
+                print(f"  [{name:12s}] torch.compile unavailable ({e.__class__.__name__}) — eager")
     orig = getattr(model, "_orig_mod", model)
     sched_T = None
     if think_schedule:
@@ -602,8 +611,8 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
     wall = time.time() - t0
     return {
         "name": name,
-        "params": count_params(model),
-        "approx_flops": estimate_fwd_flops(model),
+        "params": count_params(orig),
+        "approx_flops": estimate_fwd_flops(orig),
         "final_val_loss": hist[-1]["val_loss"] if hist else round(eval_loss(model, val_loader), 4),
         "best_val_loss": round(best_val, 4),
         "best_step": best_step,
@@ -1428,13 +1437,29 @@ def rollout_logprobs_batch(model, prompt_ids_list, gen_ids_list):
     return lps
 
 
+def _force_compile(model):
+    """torch.compile + a warmup forward so failures surface HERE, not mid-training."""
+    compiled = torch.compile(model, mode="reduce-overhead")
+    dummy = torch.zeros(1, 4, dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        compiled(dummy)
+    return compiled
+
+
 def maybe_compile(model, args):
-    """torch.compile (kernel fusion / CUDA graphs) with safe fallback."""
+    """torch.compile (kernel fusion / CUDA graphs) with safe eager fallback.
+
+    Skipped for TinyBrain: its python control flow (confidence .item() breaks,
+    grad-mode switches) triggers constant recompilation — slower, not faster.
+    """
     if getattr(args, "compile", False):
+        if isinstance(getattr(model, "_orig_mod", model), TinyBrainModel):
+            print("  compile skipped for TinyBrain (graph breaks)")
+            return model
         try:
-            return torch.compile(model, mode="reduce-overhead")
+            return _force_compile(model)
         except Exception as e:
-            print(f"  torch.compile unavailable: {e}")
+            print(f"  torch.compile unavailable ({e.__class__.__name__}) — eager")
     return model
 
 
@@ -1555,6 +1580,21 @@ def _num_match(pred, gold):
     return pred == gold
 
 
+def _gsm8k_reward(text, gold):
+    """Partial reward: format credit + exact-match credit.
+
+    Sparse exact-match alone gives ZERO signal until the model can already
+    produce a perfect answer (cold start) — the loss then drifts on KL alone.
+    Format credit lets RL learn the '#### ' habit first, then the answer.
+    """
+    r = 0.0
+    if "####" in text:
+        r += 0.2
+    if _num_match(_gsm8k_ans(text), _gsm8k_ans(gold)):
+        r += 1.0
+    return r
+
+
 def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
     """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency).
 
@@ -1566,7 +1606,7 @@ def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
     if w2i is None:
         w2i, i2w = _GSM["w2i"], _GSM["i2w"]
     sample = max(1, args.reason_samples)
-    chunk = 256 if sample == 1 else max(32, 256 // sample)
+    chunk = 32 if sample == 1 else max(8, 32 // sample)  # small: (B,L,vocab) logits are the memory hog
     correct, total = 0, 0
     for c0 in range(0, len(prompts), chunk):
         chunk_p = prompts[c0:c0 + chunk]
@@ -1663,8 +1703,8 @@ def mode_grpo(args):
         roll_gold = [a for a in answers_b for _ in range(K)]
         full = generate_batch(m, roll_prompts, max_new=rl_max, temp=args.rl_temp)
         gens = [f[len(p):] for f, p in zip(full, roll_prompts)]
-        rewards = [1.0 if _num_match(_gsm8k_ans(_word_decode(g, i2w)), _gsm8k_ans(a))
-                   else 0.0 for g, a in zip(gens, roll_gold)]
+        rewards = [_gsm8k_reward(_word_decode(g, i2w), a)
+                   for g, a in zip(gens, roll_gold)]
         # group-relative advantage per prompt (K rollouts per group)
         advs = []
         for k0 in range(0, len(rewards), K):
@@ -1675,8 +1715,10 @@ def mode_grpo(args):
         # one batched log-prob forward for policy + reference
         lps = rollout_logprobs_batch(m, roll_prompts, gens)
         lprefs = rollout_logprobs_batch(ref, roll_prompts, gens)
-        total = sum(-(adv * lp) + args.rl_kl * (lp - lpref)
-                    for adv, lp, lpref in zip(advs, lps, lprefs))
+        total = 0.0
+        for (p, g), adv, lp, lpref in zip(zip(roll_prompts, gens), advs, lps, lprefs):
+            # per-token normalization keeps the KL term stable across lengths
+            total += (-(adv * lp) + args.rl_kl * (lp - lpref)) / max(len(g), 1)
         loss = total / len(advs)
         opt.zero_grad()
         loss.backward()

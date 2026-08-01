@@ -107,4 +107,17 @@ ib = sp.mode_inference_bench(args)
 assert "v2_vs_600b_dense_cost" in ib["summary"] and "avg_think_steps" in ib["models"]["hybrid_v2"]
 print("inference_bench OK: v2 vs 600b =", ib["summary"]["v2_vs_600b_dense_cost"], "x cheaper")
 
+# 9) partial reward + estimate-on-compiled fix
+assert sp._gsm8k_reward("blah #### 42", "#### 42") == 1.2
+assert sp._gsm8k_reward("blah #### 43", "#### 42") == 0.2
+assert sp._gsm8k_reward("no format", "#### 42") == 0.0
+print("partial reward OK")
+
+# 10) train_one with compile=True on TF: must not crash (estimate uses orig)
+from scale_path import make_tf
+tf_c = make_tf(VOCAB, layers=2)
+tr_c = train_one(tf_c, tl, vl, steps=4, name="tf_c", log_every=2, lr=1e-3, warmup_fraction=0.3, compile=True)
+print("tf compile=True train OK, approx_flops =", tr_c["approx_flops"])
+assert tr_c["approx_flops"] > 0
+
 print("ALL_SMOKE_OK")

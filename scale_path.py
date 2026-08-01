@@ -1571,7 +1571,7 @@ def _gsm8k_ans(text):
 
 def _num_match(pred, gold):
     def norm(s):
-        s = s.replace(",", "").strip()
+        s = s.replace(",", "").replace(" ", "").strip()  # "1 2 3" -> "123"
         try:
             return round(float(s), 4)
         except Exception:
@@ -1620,8 +1620,11 @@ def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
         for i in range(len(chunk_p)):
             preds = [_word_decode(gen_i[len(qids[i]):], i2w) for gen_i in (g[i] for g in all_ids)]
             best = Counter(_gsm8k_ans(p) for p in preds).most_common(1)[0][0]
-            correct += int(_num_match(best, _gsm8k_ans(chunk_a[i])))
+            ok = int(_num_match(best, _gsm8k_ans(chunk_a[i])))
+            correct += ok
             total += 1
+            if total <= 3:  # debug: show what the model actually emits
+                print(f"    sample {total}: gold={_gsm8k_ans(chunk_a[i])!r} pred={best!r}")
         print(f"  gsm8k {total}/{len(prompts)} acc={correct / max(total, 1):.4f}")
     return correct / max(total, 1)
 
@@ -1738,13 +1741,14 @@ def mode_grpo(args):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step()
-        hit = sum(1 for r in rewards if r > 0)
-        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "hit": hit})
+        fmt = sum(1 for r in rewards if r >= 0.2)
+        full = sum(1 for r in rewards if r >= 1.0)
+        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "fmt": fmt, "full": full})
         if (step + 1) % 5 == 0 or step + 1 == args.rl_steps:
             el = time.time() - t0
             eta = el / (step + 1) * (args.rl_steps - step - 1)
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
-                  f"hit={hit}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
+                  f"fmt={fmt}/{len(rewards)} full={full}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
 
     # eval at the full think depth
     for c in m.cells:

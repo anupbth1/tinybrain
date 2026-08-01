@@ -75,6 +75,7 @@ class NovaModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.embed.weight = self.lm_head.weight
+        self.label_smoothing = 0.0  # harness sets via --label_smooth
 
     def forward(self, input_ids, labels=None, **kw):
         B, S = input_ids.shape
@@ -89,7 +90,8 @@ class NovaModel(nn.Module):
         if labels is not None:
             shift = logits[..., :-1, :].contiguous()
             target = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1), ignore_index=-100)
+            loss = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1),
+                                   ignore_index=-100, label_smoothing=self.label_smoothing)
             out["loss"] = loss
         return out
 

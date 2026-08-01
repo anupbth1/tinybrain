@@ -17,6 +17,10 @@ Usage (Colab/RunPod — use ! in notebook cells):
   !python scale_path.py --mode equal_flops --think_steps 8 --tf_layers 6   # V2-T8 vs bigger TF
   !python scale_path.py --mode equal_flops --think_steps 8 --think_rank 32 # cheaper thinking
   !python scale_path.py --mode equal_flops --ema 0.999           # EMA weights (overfitting defense)
+  !python scale_path.py --mode equal_flops --think_steps 8 --think_rank 32 --thought_paths 2  # multi-agent
+  !python scale_path.py --mode equal_flops --dataset code --seq_len 512 --think_steps 8  # code data
+  !python scale_path.py --mode code_eval --dataset code --seq_len 512 --think_steps 8 --amp  # HumanEval pass@1
+  !python scale_path.py --mode equal_flops --data_mix tinystories:0.5,wikitext:0.3,openwebtext:0.2  # replay-style
 
 Fairness defaults: LR schedule keyed to TOKENS (warmup+cosine), equal-FLOPs
 compares BEST val with paired t-test/sign test over seeds, full budget per
@@ -110,20 +114,23 @@ def _texts_to_data(texts, w2i, seq_len=64, min_words=5):
     return data
 
 
-def load_tinystories(max_samples=5000, seq_len=64):
+def _tinystories_texts(max_samples=5000):
     ds = _hf_load("roneneldan/TinyStories", split="train")
-    texts = ds["text"][:max_samples]
+    return list(ds["text"][:max_samples])
+
+
+def load_tinystories(max_samples=5000, seq_len=64):
+    texts = _tinystories_texts(max_samples)
     w2i = _word_vocab(texts)
     data = _texts_to_data(texts, w2i, seq_len)
     return data, len(w2i)
 
 
-def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
-    """WikiText-2 raw — out-of-distribution vs TinyStories (prose → encyclopedia).
+def _wikitext_texts(max_samples=20000):
+    """WikiText-2 raw — OOD vs TinyStories (prose → encyclopedia).
 
-    Tries the HF Hub first; if the Hub is unreachable (common on Colab where
-    only cached datasets load), falls back to downloading the canonical
-    wikitext-2 zip from s3 and parsing the raw .tokens files directly.
+    HF first; falls back to the canonical s3 zip when the Hub is unreachable
+    (common on Colab where only cached datasets load).
     """
     try:
         ds = _hf_load("Salesforce/wikitext", config="wikitext-2-raw-v1", split="train")
@@ -140,19 +147,20 @@ def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
         with zipfile.ZipFile(zpath) as zf:
             raw = zf.read("wikitext-2/wiki.train.tokens").decode()
         texts = [t for t in raw.splitlines() if len(t.strip()) > 5]
-    if max_samples:
-        texts = texts[:max_samples]
+    return texts[:max_samples] if max_samples else texts
+
+
+def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
+    texts = _wikitext_texts(max_samples)
     w2i = _word_vocab(texts, top_k=top_k)
     data = _texts_to_data(texts, w2i, seq_len)
     print(f"  wikitext: {len(data)} seqs vocab={len(w2i)}")
     return data, len(w2i)
 
 
-def load_openwebtext(max_samples=20000, seq_len=64, top_k=20000):
-    """OpenWebText subset via streaming (downloads shards on the fly).
-
-    Note: the bare repo id 'openwebtext' fails on newer datasets versions
-    (HfUriError) — the canonical namespace/name id is Skylion007/openwebtext.
+def _owt_texts(max_samples=20000):
+    """OpenWebText subset via streaming. Bare 'openwebtext' fails on newer
+    datasets versions (HfUriError) — use the canonical Skylion007/openwebtext.
     """
     ds = _hf_load("Skylion007/openwebtext", split="train", streaming=True)
     texts = []
@@ -162,9 +170,101 @@ def load_openwebtext(max_samples=20000, seq_len=64, top_k=20000):
             texts.append(t)
         if len(texts) >= max_samples:
             break
+    return texts
+
+
+def load_openwebtext(max_samples=20000, seq_len=64, top_k=20000):
+    texts = _owt_texts(max_samples)
     w2i = _word_vocab(texts, top_k=top_k)
     data = _texts_to_data(texts, w2i, seq_len)
     print(f"  openwebtext: {len(data)} seqs vocab={len(w2i)}")
+    return data, len(w2i)
+
+
+_CODE_TOK = None  # module-level BPE cache for --dataset code (used by code_eval)
+
+
+def _bpe_tokenizer(texts, vocab_size=8000):
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(vocab_size=vocab_size,
+                                  special_tokens=["<pad>", "<unk>", "<eos>"],
+                                  min_frequency=2)
+    tok.train_from_iterator((t for t in texts), trainer)
+    return tok
+
+
+def _byte_tokenizer(texts):
+    """Fallback vocab when the tokenizers lib is missing: byte-level ids."""
+    vocab = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+    for t in texts:
+        for b in t.encode("utf-8", errors="ignore"):
+            vocab.setdefault(f"b{b}", len(vocab))
+    return vocab
+
+
+def _encode(tok, text, seq_len):
+    if isinstance(tok, dict):
+        return [tok.get(f"b{b}", 1) for b in text.encode("utf-8", errors="ignore")[:seq_len]]
+    return tok.encode(text).ids[:seq_len]
+
+
+def _decode(tok, ids):
+    if isinstance(tok, dict):
+        return bytes(int(k[1:]) for k in ids if str(k).startswith("b")).decode("utf-8", errors="ignore")
+    return tok.decode(ids)
+
+
+def load_code(max_samples=20000, seq_len=512, vocab_size=8000):
+    """Code corpus for the market test: stream GitHub code, train a BPE."""
+    global _CODE_TOK
+    ds = _hf_load("codeparrot/github-code", split="train", streaming=True)
+    texts = []
+    for ex in ds:
+        c = ex.get("code", ex.get("text", ""))
+        if len(c) > 40:
+            texts.append(c)
+        if len(texts) >= max_samples:
+            break
+    if _CODE_TOK is None:
+        try:
+            _CODE_TOK = _bpe_tokenizer(texts[: min(4000, len(texts))], vocab_size)
+        except Exception:
+            print("  tokenizers lib missing — using byte-level fallback vocab")
+            _CODE_TOK = _byte_tokenizer(texts[: min(2000, len(texts))])
+    data = [torch.tensor(_encode(_CODE_TOK, t, seq_len), dtype=torch.long) for t in texts]
+    vocab = len(_CODE_TOK)
+    print(f"  code: {len(data)} seqs vocab={vocab}")
+    return data, vocab
+
+
+def load_mixed(args):
+    """Blend multiple WORD-level datasets into one shared vocab (replay-style).
+    Use when data keeps arriving: mix old corpora with new so the model does
+    not overfit the newest slice or forget the old ones.
+    """
+    collectors = {
+        "tinystories": lambda n: _tinystories_texts(n),
+        "wikitext": lambda n: _wikitext_texts(n),
+        "openwebtext": lambda n: _owt_texts(n),
+    }
+    specs = []
+    for part in args.data_mix.split(","):
+        name, frac = part.split(":")
+        name, frac = name.strip(), float(frac)
+        if name not in collectors:
+            raise ValueError(f"data_mix: unknown source {name!r} (use tinystories/wikitext/openwebtext)")
+        specs.append((name, frac))
+    total = sum(f for _, f in specs)
+    texts = []
+    for name, frac in specs:
+        n = int(args.samples * frac / total)
+        texts += collectors[name](max(n, 1))
+    w2i = _word_vocab(texts, top_k=30000)
+    data = _texts_to_data(texts, w2i, args.seq_len)
+    print(f"  mixed({args.data_mix}): {len(data)} seqs vocab={len(w2i)}")
     return data, len(w2i)
 
 
@@ -201,12 +301,14 @@ def gate_stats(model):
 
 
 @torch.no_grad()
-def eval_loss(model, loader):
+def eval_loss(model, loader, amp=False):
     model.eval()
+    use_amp = amp and DEVICE == "cuda"
     total, n = 0.0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        total += model(x, labels=y)["loss"].item()
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            total += model(x, labels=y)["loss"].item()
         n += 1
     return total / max(n, 1)
 
@@ -277,7 +379,7 @@ def make_tf(vocab, hidden=256, layers=3, heads=4):
     return NovaModel(cfg).to(DEVICE)
 
 
-def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None, rank=None):
+def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1):
     """
     variants:
       plain      — no attention
@@ -312,13 +414,14 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, shar
         diversity_weight=0.05 if variant != "plain" else 0.0,
         memory_sharp_init=5.0 if sharp is None else sharp,
         think_rank=rank,
+        num_thought_paths=paths,
     )
     return TinyBrainModel(cfg).to(DEVICE)
 
 
 def train_one(model, train_loader, val_loader, steps, name, log_every=200,
               use_cosine=True, early_stop_patience_steps=0, lr=3e-4,
-              warmup_fraction=0.02, ema=0.0):
+              warmup_fraction=0.02, ema=0.0, amp=False, seq_len=SEQ_LEN):
     """Train with an LR schedule keyed to TOKENS, not steps.
 
     Why tokens: in equal-FLOPs runs the two models get different step counts.
@@ -328,8 +431,9 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
 
     ema>0: exponential moving average of weights; val loss is evaluated on the
     EMA weights (standard overfitting defense, usually worth ~0.1-0.3 nats).
+    amp: bf16 autocast (Ampere+) — ~2x wall-clock on the sequential think loop.
     """
-    tok_per_step = train_loader.batch_size * SEQ_LEN
+    tok_per_step = train_loader.batch_size * seq_len
     total_tokens = steps * tok_per_step
     warm_tokens = max(int(total_tokens * warmup_fraction), 1)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -355,10 +459,10 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
         if state_dict is not None:
             saved = {k: v.detach().clone() for k, v in model.state_dict().items()}
             model.load_state_dict(state_dict)
-            vl = eval_loss(model, val_loader)
+            vl = eval_loss(model, val_loader, amp=amp)
             model.load_state_dict(saved)
         else:
-            vl = eval_loss(model, val_loader)
+            vl = eval_loss(model, val_loader, amp=amp)
         model.train()
         return vl
 
@@ -373,8 +477,9 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
                 break
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad()
-            loss = model(x, labels=y)["loss"]
-            loss.backward()
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and DEVICE == "cuda"):
+                loss = model(x, labels=y)["loss"]
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             if sched is not None:
@@ -479,16 +584,20 @@ def diagnose_internals(model, batch):
 
 def get_loaders(args, seed=0):
     print(f"Loading {args.dataset}...")
-    if args.dataset == "wikitext":
-        data, vocab = load_wikitext(args.samples)
+    if args.data_mix:
+        data, vocab = load_mixed(args)
+    elif args.dataset == "wikitext":
+        data, vocab = load_wikitext(args.samples, args.seq_len)
     elif args.dataset == "openwebtext":
-        data, vocab = load_openwebtext(args.samples)
+        data, vocab = load_openwebtext(args.samples, args.seq_len)
+    elif args.dataset == "code":
+        data, vocab = load_code(args.samples, args.seq_len)
     else:
-        data, vocab = load_tinystories(args.samples)
+        data, vocab = load_tinystories(args.samples, args.seq_len)
     split = int(len(data) * 0.9)
     g = torch.Generator().manual_seed(seed)  # deterministic shuffle per seed
-    tl = torch.utils.data.DataLoader(SeqDS(data[:split]), batch_size=args.batch, shuffle=True, generator=g)
-    vl = torch.utils.data.DataLoader(SeqDS(data[split:]), batch_size=args.batch)
+    tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len), batch_size=args.batch, shuffle=True, generator=g)
+    vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len), batch_size=args.batch)
     print(f"  seqs={len(data)} vocab={vocab} device={DEVICE}")
     return tl, vl, vocab
 
@@ -499,9 +608,9 @@ def mode_race(args):
     results = {"meta": _meta(args, "race"), "models": {}}
     print("\n=== RACE: Transformer vs Hybrid v1 vs Hybrid v2 ===")
     print("NOTE: report BEST val_loss (final can overfit, especially TF).")
-    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema)
-    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema)
-    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema)
+    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
 
     tf_b = results["models"]["transformer"]["best_val_loss"]
     print("\n" + "=" * 64)
@@ -536,8 +645,8 @@ def mode_diagnose(args):
     print("\n=== DIAGNOSE internals (v1 vs v2) — after memory/diversity fix ===")
     print("Targets: iter_cos < 0.98 | mem_entropy_ratio < 0.85 | top1 > 0.15")
     for variant in ["hybrid_v1", "hybrid_v2"]:
-        m = make_tb(vocab, variant, sharp=args.memory_sharp, rank=args.think_rank)
-        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema)
+        m = make_tb(vocab, variant, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         batch = next(iter(vl))[0][:4]
         diag = diagnose_internals(m, batch)
         results["models"][variant] = {
@@ -562,13 +671,13 @@ def mode_think_scale(args):
     print("If more steps ⇒ lower BEST loss, compute-scaling thesis is alive.")
     for tsteps in [1, 2, 4, 8]:
         name = f"v2_T{tsteps}"
-        m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp, rank=args.think_rank)
+        m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
         for c in m.cells:
             c.min_s = tsteps
             c.max_s = tsteps
-        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema)
+        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         results["models"][name]["think_steps"] = tsteps
-        mf = measure_fwd_flops(m)
+        mf = measure_fwd_flops(m, args.seq_len)
         if mf:
             results["models"][name]["measured_flops"] = mf
 
@@ -616,11 +725,13 @@ def mode_verify_claim(args):
         tl, vl, vocab = get_loaders(args, seed)
         print(f"\n--- seed {seed} ---")
         tf_m = make_tf(vocab)
-        v2_m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank)
+        v2_m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        tf_m.label_smoothing = args.label_smooth
+        v2_m.label_smoothing = args.label_smooth
         tf_r = train_one(tf_m, tl, vl, args.steps, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         v2_r = train_one(v2_m, tl, vl, args.steps, f"V2_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         last_v2, last_batch = v2_m, next(iter(vl))[0][:4]
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -703,9 +814,10 @@ def mode_memory_ablation(args):
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
-        m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank)
+        m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        m.label_smoothing = args.label_smooth
         train_one(m, tl, vl, args.steps, f"v2_s{seed}", args.log_every,
-                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema)
+                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         batch = next(iter(vl))[0][:4]
         internals_all.append(diagnose_internals(m, batch))
 
@@ -891,13 +1003,15 @@ def mode_equal_flops(args):
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
         tf = make_tf(vocab, layers=args.tf_layers)
-        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp, rank=args.think_rank)
+        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        tf.label_smoothing = args.label_smooth
+        v2.label_smoothing = args.label_smooth
         for c in v2.cells:
             c.min_s = args.think_steps
             c.max_s = args.think_steps
         # Prefer profiler-measured FLOPs (hand-rolled counters proved unreliable).
-        f_tf = measure_fwd_flops(tf) or estimate_fwd_flops(tf)
-        f_v2 = measure_fwd_flops(v2) or estimate_fwd_flops(v2)
+        f_tf = measure_fwd_flops(tf, args.seq_len) or estimate_fwd_flops(tf)
+        f_v2 = measure_fwd_flops(v2, args.seq_len) or estimate_fwd_flops(v2)
         if f_tf is None or f_v2 is None:
             flops_method = "estimate"
         f_tf_est, f_v2_est = estimate_fwd_flops(tf), estimate_fwd_flops(v2)
@@ -908,9 +1022,9 @@ def mode_equal_flops(args):
               f"FLOPs/step ratio={f_v2/f_tf:.2f}x ({flops_method}; est {f_v2_est/f_tf_est:.2f}x) ---")
         # No early stopping: both models consume the FULL budget (fair FLOPs race).
         tf_r = train_one(tf, tl, vl, steps_tf, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         v2_r = train_one(v2, tl, vl, steps_v2, f"V2_s{seed}", max(50, args.log_every // 2),
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
         last_v2 = v2
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -1098,7 +1212,7 @@ def mode_assoc_recall(args):
 
     results = {"meta": _meta(args, "assoc_recall"), "models": {}}
     results["models"]["transformer"] = train_assoc(make_tf(vocab), "TF")
-    results["models"]["hybrid_v2"] = train_assoc(make_tb(vocab, "hybrid_v2", rank=args.think_rank), "V2")
+    results["models"]["hybrid_v2"] = train_assoc(make_tb(vocab, "hybrid_v2", rank=args.think_rank, paths=args.thought_paths), "V2")
     tf_a = results["models"]["transformer"]["best"]["acc"]
     v2_a = results["models"]["hybrid_v2"]["best"]["acc"]
     results["summary"] = {
@@ -1117,6 +1231,82 @@ def mode_assoc_recall(args):
     return results
 
 
+@torch.no_grad()
+def generate(model, tok, prompt_ids, max_new=200, context=512, device=DEVICE):
+    """Greedy autoregressive completion for code_eval."""
+    model.eval()
+    ids = list(prompt_ids)
+    for _ in range(max_new):
+        x = torch.tensor([ids[-context:]], device=device)
+        logits = model(x)["logits"][0, -1]
+        nxt = int(logits.argmax().item())
+        ids.append(nxt)
+        if nxt == 2:  # <eos> where available
+            break
+    return ids
+
+
+def _check_code(code, test, timeout=3.0):
+    """Execute prompt+completion+asserts in a subprocess; True iff exit 0."""
+    import subprocess
+    import sys
+    try:
+        r = subprocess.run([sys.executable, "-c", code + "\n" + test],
+                           capture_output=True, timeout=timeout)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def mode_code_eval(args):
+    """Market test: train on code, then measure HumanEval pass@1 (execution).
+
+    The multi-agent (mixture-of-thoughts) and internal-simulation story is
+    exercised here: the model plans, writes, and self-corrects inside the
+    think loop before emitting code.
+    """
+    tl, vl, vocab = get_loaders(args)
+    m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
+                rank=args.think_rank, paths=args.thought_paths)
+    for c in m.cells:
+        c.min_s = args.think_steps
+        c.max_s = args.think_steps
+    m.label_smoothing = args.label_smooth
+    tr = train_one(m, tl, vl, args.steps, "code_model", args.log_every,
+                   early_stop_patience_steps=args.early_stop, lr=args.lr,
+                   amp=args.amp, seq_len=args.seq_len)
+
+    print("\n=== HUMANEVAL pass@1 (execution-based) ===")
+    ds = _hf_load("openai_humaneval", split="test")
+    tok = _CODE_TOK
+    if tok is None:
+        print("  ERROR: --dataset code required before --mode code_eval (no tokenizer)")
+        return None
+    correct = 0
+    rows = []
+    for i, ex in enumerate(ds):
+        prompt = ex["prompt"]
+        pid = _encode(tok, prompt, args.seq_len - 20)
+        gen = generate(m, tok, pid, max_new=args.max_new, context=args.seq_len)
+        comp = _decode(tok, gen[len(pid):])
+        comp = comp.split("\ndef ")[0].split("\nclass ")[0]  # one function only
+        ok = _check_code(prompt + comp, ex.get("test", ""))
+        correct += ok
+        rows.append({"problem": ex.get("entry_point", i), "ok": ok})
+        if (i + 1) % 20 == 0 or i == len(ds) - 1:
+            print(f"  humaneval {i + 1}/{len(ds)} | correct={correct} pass@1={correct / (i + 1):.4f}")
+    pass1 = correct / max(len(ds), 1)
+    results = {"meta": _meta(args, "code_eval"), "train": tr, "pass@1": round(pass1, 4),
+               "n_problems": len(ds), "correct": correct, "rows": rows}
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    print(f"HumanEval pass@1: {pass1:.4f} ({correct}/{len(ds)})")
+    print("Market target: small + thinking must approach big-model pass@1 at far lower cost.")
+    _save(results, "code_eval")
+    return results
+
+
 def _meta(args, mode):
     return {
         "mode": mode,
@@ -1125,6 +1315,11 @@ def _meta(args, mode):
         "batch": args.batch,
         "samples": args.samples,
         "dataset": getattr(args, "dataset", "tinystories"),
+        "data_mix": getattr(args, "data_mix", None),
+        "seq_len": getattr(args, "seq_len", 64),
+        "thought_paths": getattr(args, "thought_paths", 1),
+        "label_smooth": getattr(args, "label_smooth", 0.0),
+        "amp": getattr(args, "amp", False),
         "lr": getattr(args, "lr", 3e-4),
         "warmup_fraction": getattr(args, "warmup", 0.02),
         "seeds": args.seeds,
@@ -1133,6 +1328,7 @@ def _meta(args, mode):
         "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
         "memory_fix": "selective slot write + sharp read",
         "diversity_fix": "relu(cos-0.95) aux loss",
+        "multi_agent": "mixture-of-thoughts: parallel specialist paths + coordinator gate (Grok-style)",
         "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds",
     }
 
@@ -1182,8 +1378,12 @@ def main():
     p.add_argument("--samples", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--seeds", type=str, default="0,1,2", help="comma seeds for multi-seed modes")
-    p.add_argument("--dataset", choices=["tinystories", "wikitext", "openwebtext"], default="tinystories",
-                   help="tinystories | wikitext (WikiText-2 raw) | openwebtext (streaming subset)")
+    p.add_argument("--dataset", choices=["tinystories", "wikitext", "openwebtext", "code"], default="tinystories",
+                   help="tinystories | wikitext (WikiText-2 raw) | openwebtext (streaming) | code (BPE, for code_eval)")
+    p.add_argument("--data_mix", type=str, default=None,
+                   help="blend word datasets into one shared vocab, e.g. tinystories:0.5,wikitext:0.3,openwebtext:0.2 "
+                        "(replay-style: avoids overfitting the newest corpus)")
+    p.add_argument("--seq_len", type=int, default=64, help="sequence length (code wants 256-512)")
     p.add_argument("--memory_sharp", type=float, default=None,
                    help="override memory_sharp_init (effective read scale = softplus(init)/sqrt(d)); higher ⇒ sharper slot selection")
     p.add_argument("--lr", type=float, default=3e-4)
@@ -1200,6 +1400,14 @@ def main():
                    help="EMA decay for weights (0=off). Only helps NEAR CONVERGENCE: "
                         "use 0.99 for short runs (~100-step window), 0.999 needs 10k+ steps. "
                         "Val is evaluated on EMA weights.")
+    p.add_argument("--thought_paths", type=int, default=1,
+                   help="mixture-of-thoughts: K parallel think trajectories + coordinator gate "
+                        "(Grok-style specialist agents inside one forward pass; 1 = current behavior)")
+    p.add_argument("--label_smooth", type=float, default=0.0,
+                   help="label smoothing for LM loss (0=off; 0.01-0.05 helps overfitting on big data)")
+    p.add_argument("--amp", action="store_true",
+                   help="bf16 autocast (Ampere+) — ~2x wall-clock on the sequential think loop")
+    p.add_argument("--max_new", type=int, default=200, help="max generated tokens in code_eval")
     args = p.parse_args()
     if args.verify:
         verify()
@@ -1212,6 +1420,7 @@ def main():
         "memory_ablation": mode_memory_ablation,
         "equal_flops": mode_equal_flops,
         "assoc_recall": mode_assoc_recall,
+        "code_eval": mode_code_eval,
     }
     modes[args.mode](args)
 

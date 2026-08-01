@@ -1,4 +1,4 @@
-"""Smoke: think_rank (low-rank thinking) + EMA + full mode with new args."""
+"""Smoke: thought_paths (multi-agent), label smoothing, amp flag, code_eval pieces."""
 import argparse
 import math
 import sys
@@ -14,38 +14,52 @@ torch.manual_seed(0)
 VOCAB = 300
 data = [torch.randint(1, VOCAB, (64,)).long() for _ in range(150)]
 split = 130
-tl = torch.utils.data.DataLoader(SeqDS(data[:split]), batch_size=8, shuffle=True)
-vl = torch.utils.data.DataLoader(SeqDS(data[split:]), batch_size=8)
+tl = torch.utils.data.DataLoader(SeqDS(data[:split], 64), batch_size=8, shuffle=True)
+vl = torch.utils.data.DataLoader(SeqDS(data[split:], 64), batch_size=8)
 
-# 1) think_rank: FLOPs must drop vs full-rank, forward/backward must work
-m_full = make_tb(VOCAB, "hybrid_v2", think_steps=8)
-m_lr = make_tb(VOCAB, "hybrid_v2", think_steps=8, rank=32)
-f_full = measure_fwd_flops(m_full)
-f_lr = measure_fwd_flops(m_lr)
-print(f"T8 flops full-rank={f_full:,} low-rank(32)={f_lr:,} reduction={f_lr/f_full:.2f}x")
-assert f_lr < f_full, "low-rank must be cheaper"
+# 1) mixture-of-thoughts: K=2 forward/backward + FLOPs increase
+m1 = make_tb(VOCAB, "hybrid_v2", think_steps=4, paths=1)
+m2 = make_tb(VOCAB, "hybrid_v2", think_steps=4, paths=2)
+f1, f2 = measure_fwd_flops(m1), measure_fwd_flops(m2)
+print(f"paths=1 flops={f1:,} paths=2 flops={f2:,} ratio={f2/f1:.2f}")
+assert f2 > f1
 x = torch.randint(0, VOCAB, (2, 64))
-out = m_lr(x, labels=x)
+out = m2(x, labels=x)
 assert math.isfinite(out["loss"].item())
 out["loss"].backward()
-print("low-rank forward+backward OK, params:", sum(p.numel() for p in m_lr.parameters()))
+print("paths=2 forward+backward OK, params:", sum(p.numel() for p in m2.parameters()))
 
-# 2) EMA training runs
-r = train_one(make_tb(VOCAB, "hybrid_v2", rank=32), tl, vl, steps=8, name="ema_t",
-              log_every=4, lr=1e-3, warmup_fraction=0.3, ema=0.99)
-print("ema result best=%.4f ema_flag=%s" % (r["best_val_loss"], r["ema"]))
-assert r["ema"] == 0.99
+# 2) training with paths=2 + label smoothing + amp flag (CPU-safe)
+m = make_tb(VOCAB, "hybrid_v2", think_steps=4, paths=2)
+m.label_smoothing = 0.05
+r = train_one(m, tl, vl, steps=6, name="paths2", log_every=3, lr=1e-3, warmup_fraction=0.3,
+              amp=True, seq_len=64)
+print("paths=2 train best=%.4f" % r["best_val_loss"])
+assert r["best_val_loss"] > 0
 
-# 3) full equal_flops with think_rank + ema + stubbed loaders
+# 3) generate + _check_code with a trivial toy
+tok = {"<pad>": 0, "<unk>": 1, "<eos>": 2, "b97": 3, "b98": 4, "b10": 5, "b32": 6}
+mm = make_tb(VOCAB, "hybrid_v2", think_steps=2)
+pid = [3, 4]
+gen = sp.generate(mm, tok, pid, max_new=10, context=16)
+print("generate len:", len(gen))
+assert len(gen) >= len(pid)
+ok = sp._check_code("def f():\n    return 4\n", "assert f() == 4\n")
+bad = sp._check_code("def f():\n    return 3\n", "assert f() == 4\n")
+print("check_code ok=%s bad=%s" % (ok, bad))
+assert ok and not bad
+
+# 4) equal_flops with paths + seq_len via stubbed loaders
 def fake_loaders(args, seed=0):
     return tl, vl, VOCAB
 
 sp.get_loaders = fake_loaders
 args = argparse.Namespace(seeds="0", steps=8, batch=8, samples=150, dataset="tinystories",
+                          data_mix=None, seq_len=64, thought_paths=2, label_smooth=0.0, amp=False,
                           log_every=4, memory_sharp=None, lr=1e-3, warmup=0.3, early_stop=0,
-                          think_steps=8, tf_layers=3, think_rank=32, ema=0.0)
+                          think_steps=4, tf_layers=3, think_rank=None, ema=0.0, max_new=64)
 r2 = sp.mode_equal_flops(args)
-assert r2["seeds"]["0"]["flops_v2"] < f_full  # low-rank flops used
-print("equal_flops(rank32) Δ=%.4f flops_v2=%d" % (r2["summary"]["delta_mean"], r2["seeds"]["0"]["flops_v2"]))
+assert r2["seeds"]["0"]["flops_v2"] > r2["seeds"]["0"]["flops_tf"]
+print("equal_flops(paths=2) Δ=%.4f ratio=%.2f" % (r2["summary"]["delta_mean"], r2["seeds"]["0"]["flops_v2"] / r2["seeds"]["0"]["flops_tf"]))
 
 print("ALL_SMOKE_OK")

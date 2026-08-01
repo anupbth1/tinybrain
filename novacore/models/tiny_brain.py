@@ -59,6 +59,11 @@ class TinyBrainConfig:
     # None → full d×d branches (current behavior). r << d makes T8/T16 affordable
     # at equal FLOPs and cuts the sequential think-loop cost for wall-clock.
     think_rank: Optional[int] = None
+    # Mixture-of-thoughts: run K parallel think trajectories (specialist
+    # "agents") on a SHARED memory scratchpad, then a coordinator gate merges
+    # their residuals. Maps Grok-style coordinator + specialist agents into a
+    # single forward pass. K=1 is the current single-trajectory behavior.
+    num_thought_paths: int = 1
 
 
 class ThinkingStep(nn.Module):
@@ -81,7 +86,10 @@ class ThinkingStep(nn.Module):
         self.gamma = nn.Parameter(torch.tensor([config.gamma_init]))
         self.step_conditioned = config.step_conditioned_think
         if self.step_conditioned:
-            self.step_emb = nn.Embedding(config.max_think_steps + 1, d)
+            # Room for all trajectories: each path k uses steps [k*max_s, (k+1)*max_s)
+            self.step_emb = nn.Embedding(
+                config.max_think_steps * max(1, config.num_thought_paths) + 1, d
+            )
             nn.init.normal_(self.step_emb.weight, std=config.initializer_range)
 
     def forward(self, x, step: int = 0):
@@ -252,25 +260,27 @@ class AdaptiveThinkingCell(nn.Module):
         self.lc = config.confidence_penalty_weight
         self.ls = config.step_penalty_weight
         self.ld = config.diversity_weight
+        self.n_paths = max(1, config.num_thought_paths)
+        # Coordinator: how much each thought path's residual contributes.
+        self.path_gate = nn.Linear(d, self.n_paths, bias=False) if self.n_paths > 1 else None
+        if self.path_gate is not None:
+            nn.init.zeros_(self.path_gate.weight)  # start at uniform mixture
 
-    def forward(self, x, memory=None, return_trace: bool = False):
-        x = self.W_in(x)
-        if self.cell_attn is not None:
-            x = self.cell_attn(x)
-        x0 = x
+    def _run_trajectory(self, x0, memory, k, collect_trace=False):
+        """One specialist thought path on the shared memory blackboard."""
+        x = x0
         steps, csum = 0, 0.0
         div_pen = x.new_zeros(())
         trace = []
         prev = None
         for t in range(self.max_s):
-            x = self.think(x, step=t)
+            x = self.think(x, step=t + k * self.max_s)
             r, memory = self.mem(x, memory)
             x = x + torch.tanh(r)
             steps += 1
-            if return_trace:
+            if collect_trace:
                 trace.append(x.detach())
             if self.training and prev is not None and self.ld > 0:
-                # Penalize only when consecutive states are nearly identical
                 cos = F.cosine_similarity(
                     x.reshape(x.size(0), -1),
                     prev.reshape(prev.size(0), -1),
@@ -281,15 +291,41 @@ class AdaptiveThinkingCell(nn.Module):
             c, h = self.conf(x, x0, t)
             csum += c.mean().item()
             if t >= self.min_s - 1:
-                if not self.training and h.mean() > 0.5: break
-                if self.training and h.mean() > 0.8: break
+                if not self.training and h.mean() > 0.5:
+                    break
+                if self.training and h.mean() > 0.8:
+                    break
+        return x, memory, steps, csum, div_pen, trace
+
+    def forward(self, x, memory=None, return_trace: bool = False):
+        x = self.W_in(x)
+        if self.cell_attn is not None:
+            x = self.cell_attn(x)
+        x0 = x
+        if self.n_paths <= 1:
+            x, memory, steps, csum, div_pen, trace = self._run_trajectory(x0, memory, 0, return_trace)
+        else:
+            resids, memory, steps, csum = [], memory, 0, 0.0
+            div_pen = x.new_zeros(())
+            trace = []
+            for k in range(self.n_paths):
+                xk, memory, sk, ck, dk, tk = self._run_trajectory(x0, memory, k, return_trace)
+                resids.append(xk - x0)
+                steps += sk
+                csum += ck
+                div_pen = div_pen + dk
+                if return_trace:
+                    trace += tk
+            res = torch.stack(resids, dim=-1)                 # (B, S, d, K)
+            w = F.softmax(self.path_gate(x0), dim=-1)         # (B, S, K) coordinator
+            x = x0 + (res * w.unsqueeze(2)).sum(-1)
         out = self.W_out(x)
         aux = {}
         if self.training:
             aux["conf"] = self.lc * (1 - csum / max(steps, 1))
-            aux["step"] = self.ls * (steps / self.max_s) ** 2
+            aux["step"] = self.ls * (steps / max(self.max_s * self.n_paths, 1)) ** 2
             if steps > 1 and self.ld > 0:
-                aux["div"] = self.ld * div_pen / max(steps - 1, 1)
+                aux["div"] = self.ld * div_pen / max(steps - self.n_paths, 1)
         if return_trace:
             aux["trace"] = trace
         return out, memory, aux
@@ -331,6 +367,7 @@ class TinyBrainModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.embed.weight = self.lm_head.weight
         self.lm = config.memory_l2_weight
+        self.label_smoothing = 0.0  # harness sets via --label_smooth
         self._init()
     def _init(self):
         s = self.config.initializer_range
@@ -362,7 +399,8 @@ class TinyBrainModel(nn.Module):
         if labels is not None:
             shift = logits[..., :-1, :].contiguous()
             target = labels[..., 1:].contiguous()
-            L_lm = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1), ignore_index=-100)
+            L_lm = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1),
+                                   ignore_index=-100, label_smoothing=self.label_smoothing)
             L_mem = sum(m.pow(2).mean() for m in new_mems if m is not None) * self.lm
             L_aux = sum(aux.values()) if aux else 0
             out["loss"] = L_lm + L_mem + L_aux

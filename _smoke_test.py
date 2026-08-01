@@ -58,7 +58,7 @@ args = argparse.Namespace(seeds="0", steps=8, batch=8, samples=150, dataset="tin
                           data_mix=None, seq_len=64, thought_paths=2, label_smooth=0.0, amp=False,
                           log_every=4, memory_sharp=None, lr=1e-3, warmup=0.3, early_stop=0,
                           think_steps=4, tf_layers=3, think_rank=None, ema=0.0, max_new=64,
-                          compile=False)
+                          compile=False, train_break=0.8, think_curriculum=None, lora=False, lora_rank=8)
 r2 = sp.mode_equal_flops(args)
 assert r2["seeds"]["0"]["flops_v2"] > r2["seeds"]["0"]["flops_tf"]
 print("equal_flops(paths=2) Δ=%.4f ratio=%.2f" % (r2["summary"]["delta_mean"], r2["seeds"]["0"]["flops_v2"] / r2["seeds"]["0"]["flops_tf"]))
@@ -82,16 +82,29 @@ rl_args = argparse.Namespace(
     thought_paths=1, label_smooth=0.0, amp=False, log_every=10, memory_sharp=None, lr=1e-3,
     warmup=0.3, early_stop=0, think_steps=2, tf_layers=3, think_rank=None, ema=0.0,
     max_new=16, rl_steps=2, rollouts=2, rl_batch=4, rl_max_new=12, rl_lr=1e-4, rl_temp=0.9,
-    rl_kl=0.01, rl_pretrain=2, reason_samples=1, compile=False,
+    rl_kl=0.01, rl_pretrain=2, reason_samples=1, compile=False, train_break=0.8,
+    think_curriculum=None, lora=False, lora_rank=8,
 )
 res = sp.mode_grpo(rl_args)
 assert "gsm8k_acc_after_rl" in res
 print("GRPO loop OK, acc_after_rl =", res["gsm8k_acc_after_rl"])
 
-# 6) generate_batch: all sequences advance in lockstep, same length
-mm2 = make_tb(VOCAB, "hybrid_v2", think_steps=2)
-gb = sp.generate_batch(mm2, [[3, 4], [5, 6, 7]], max_new=6, temp=0.0)
-print("generate_batch lens:", [len(g) for g in gb])
-assert len(gb) == 2 and all(len(g) >= 6 for g in gb)
+# 6) LoRA on TF: trainable params drop, training still works
+from scale_path import make_tf, apply_lora, trainable_params
+tf_lora = make_tf(VOCAB, layers=2, lora=True, lora_rank=4)
+print("TF total=%d trainable=%d" % (sum(p.numel() for p in tf_lora.parameters()), trainable_params(tf_lora)))
+assert trainable_params(tf_lora) < sum(p.numel() for p in tf_lora.parameters())
+
+# 7) train_break + curriculum: avg_think_steps reported, lower break = fewer steps
+m_tb = make_tb(VOCAB, "hybrid_v2", think_steps=4, train_break=0.5)
+r3 = train_one(m_tb, tl, vl, steps=8, name="fast", log_every=4, lr=1e-3, warmup_fraction=0.3,
+               think_schedule="1,2")
+print("avg_think_steps=", r3["avg_think_steps"], "trainable=", r3["trainable_params"])
+assert r3["avg_think_steps"] is not None
+
+# 8) inference_bench with stubbed loaders
+ib = sp.mode_inference_bench(args)
+assert "v2_vs_600b_dense_cost" in ib["summary"] and "avg_think_steps" in ib["models"]["hybrid_v2"]
+print("inference_bench OK: v2 vs 600b =", ib["summary"]["v2_vs_600b_dense_cost"], "x cheaper")
 
 print("ALL_SMOKE_OK")

@@ -42,6 +42,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -294,6 +295,45 @@ def count_params(m):
     return sum(p.numel() for p in m.parameters())
 
 
+def trainable_params(m):
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
+class LoRALinear(nn.Module):
+    """Frozen base Linear + low-rank adapter (pure torch, no extra deps)."""
+    def __init__(self, base, r=8, alpha=16):
+        super().__init__()
+        self.base = base
+        self.base.weight.requires_grad_(False)
+        if base.bias is not None:
+            base.bias.requires_grad_(False)
+        d_in, d_out = base.weight.shape
+        self.lora_a = nn.Parameter(torch.zeros(d_in, r))
+        self.lora_b = nn.Parameter(torch.zeros(r, d_out))
+        nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
+        self.scale = alpha / max(r, 1)
+
+    def forward(self, x):
+        return self.base(x) + ((x @ self.lora_a) @ self.lora_b) * self.scale
+
+
+def apply_lora(model, rank=8):
+    """Swap QKV/O + MLP linears with LoRA adapters; freeze everything else."""
+    targets = ("W_q", "W_k", "W_v", "W_o", "W1", "W2")
+    for name, mod in list(model.named_modules()):
+        if not isinstance(mod, nn.Linear) or not any(t in name for t in targets):
+            continue
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], LoRALinear(mod, rank))
+    for name, p in model.named_parameters():
+        if "lora" not in name:
+            p.requires_grad = False
+    return model
+
+
 def gate_stats(model):
     gammas, gates = [], []
     for n, p in model.named_parameters():
@@ -347,19 +387,24 @@ def estimate_fwd_flops(model, seq_len=64, batch=1):
     return int(batch * (think + mem + attn + head))
 
 
-def measure_fwd_flops(model, seq_len=SEQ_LEN):
+def measure_fwd_flops(model, seq_len=SEQ_LEN, train_mode=True):
     """Real per-step forward FLOPs via torch's FlopCounterMode (incl. lm_head).
 
     Hand-rolled counters have proven unreliable (they swung the TF:V2 ratio by
     >2x — measured TF is ~6x the old estimate). Measured numbers are what
     reviewers will trust. Returns None if the profiler is unavailable.
+    train_mode=False measures EVAL cost (adaptive early-exit) — the number
+    that matters for running cost.
     """
     try:
         from torch.utils.flop_counter import FlopCounterMode
     except Exception:
         return None
-    was_training = model.training
-    model.train()  # training cost (dropout + full think loop), not eval cost
+    if train_mode:
+        was_training = model.training
+        model.train()  # training cost (dropout + full think loop), not eval cost
+    else:
+        model.eval()
     try:
         vocab = getattr(model.config, "vocab_size", 1000)
         x = torch.randint(0, max(1, min(vocab, 50000)), (1, seq_len),
@@ -371,10 +416,11 @@ def measure_fwd_flops(model, seq_len=SEQ_LEN):
     except Exception:
         return None
     finally:
-        model.train(was_training)
+        if train_mode:
+            model.train(was_training)
 
 
-def make_tf(vocab, hidden=256, layers=3, heads=4):
+def make_tf(vocab, hidden=256, layers=3, heads=4, lora=False, lora_rank=8):
     cfg = NovaConfig(
         vocab_size=vocab,
         hidden_size=hidden,
@@ -383,10 +429,14 @@ def make_tf(vocab, hidden=256, layers=3, heads=4):
         intermediate_size=hidden * 3,
         max_seq_length=64,
     )
-    return NovaModel(cfg).to(DEVICE)
+    m = NovaModel(cfg).to(DEVICE)
+    if lora:
+        m = apply_lora(m, rank=lora_rank)
+    return m
 
 
-def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1):
+def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1,
+            train_break=0.8):
     """
     variants:
       plain      — no attention
@@ -422,13 +472,15 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, shar
         memory_sharp_init=5.0 if sharp is None else sharp,
         think_rank=rank,
         num_thought_paths=paths,
+        train_break=train_break,
     )
     return TinyBrainModel(cfg).to(DEVICE)
 
 
 def train_one(model, train_loader, val_loader, steps, name, log_every=200,
               use_cosine=True, early_stop_patience_steps=0, lr=3e-4,
-              warmup_fraction=0.02, ema=0.0, amp=False, seq_len=SEQ_LEN, compile=False):
+              warmup_fraction=0.02, ema=0.0, amp=False, seq_len=SEQ_LEN, compile=False,
+              think_schedule=None):
     """Train with an LR schedule keyed to TOKENS, not steps.
 
     Why tokens: in equal-FLOPs runs the two models get different step counts.
@@ -441,6 +493,8 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
     amp: bf16 autocast (Ampere+) — ~2x wall-clock on the sequential think loop.
     compile: torch.compile the model (kernel fusion / CUDA graphs) — the big
     wall-clock win for the recurrent think loop.
+    think_schedule: 'T1,T2,T4,T8' curriculum — early training runs cheap
+    think steps, late training runs expensive ones (wall-clock cut, same quality).
     """
     if compile:
         try:
@@ -449,6 +503,15 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
         except Exception as e:
             print(f"  [{name:12s}] torch.compile unavailable: {e}")
     orig = getattr(model, "_orig_mod", model)
+    sched_T = None
+    if think_schedule:
+        try:
+            sched_T = [int(x) for x in think_schedule.split(",") if x.strip()]
+        except Exception:
+            sched_T = None
+    if sched_T and isinstance(orig, TinyBrainModel):
+        for c in orig.cells:
+            c.min_s = c.max_s = sched_T[0]
     tok_per_step = train_loader.batch_size * seq_len
     total_tokens = steps * tok_per_step
     warm_tokens = max(int(total_tokens * warmup_fraction), 1)
@@ -500,6 +563,11 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
             opt.step()
             if sched is not None:
                 sched.step()
+            if sched_T and isinstance(orig, TinyBrainModel):
+                t_idx = min(step * len(sched_T) // max(steps, 1), len(sched_T) - 1)
+                T = sched_T[t_idx]
+                for c in orig.cells:
+                    c.min_s = c.max_s = T
             if ema > 0 and ema_state is not None:
                 with torch.no_grad():
                     for k, v in model.state_dict().items():
@@ -550,6 +618,9 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
         "stopped_early": stopped_early,
         "time_sec": round(wall, 2),
         "history": hist,
+        "trainable_params": trainable_params(orig),
+        "avg_think_steps": round(sum(c._steps_sum for c in orig.cells) / max(sum(c._steps_n for c in orig.cells), 1), 2)
+        if isinstance(orig, TinyBrainModel) and sum(c._steps_n for c in orig.cells) > 0 else None,
         "gates": gate_stats(orig) if not isinstance(orig, NovaModel) else {},
     }
 
@@ -626,9 +697,9 @@ def mode_race(args):
     results = {"meta": _meta(args, "race"), "models": {}}
     print("\n=== RACE: Transformer vs Hybrid v1 vs Hybrid v2 ===")
     print("NOTE: report BEST val_loss (final can overfit, especially TF).")
-    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
-    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
-    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+    results["models"]["transformer"] = train_one(make_tf(vocab, lora=args.lora, lora_rank=args.lora_rank), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
+    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
+    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
 
     tf_b = results["models"]["transformer"]["best_val_loss"]
     print("\n" + "=" * 64)
@@ -663,8 +734,8 @@ def mode_diagnose(args):
     print("\n=== DIAGNOSE internals (v1 vs v2) — after memory/diversity fix ===")
     print("Targets: iter_cos < 0.98 | mem_entropy_ratio < 0.85 | top1 > 0.15")
     for variant in ["hybrid_v1", "hybrid_v2"]:
-        m = make_tb(vocab, variant, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
-        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+        m = make_tb(vocab, variant, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
+        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         batch = next(iter(vl))[0][:4]
         diag = diagnose_internals(m, batch)
         results["models"][variant] = {
@@ -689,11 +760,11 @@ def mode_think_scale(args):
     print("If more steps ⇒ lower BEST loss, compute-scaling thesis is alive.")
     for tsteps in [1, 2, 4, 8]:
         name = f"v2_T{tsteps}"
-        m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
         for c in m.cells:
             c.min_s = tsteps
             c.max_s = tsteps
-        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         results["models"][name]["think_steps"] = tsteps
         mf = measure_fwd_flops(m, args.seq_len)
         if mf:
@@ -742,14 +813,14 @@ def mode_verify_claim(args):
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
         print(f"\n--- seed {seed} ---")
-        tf_m = make_tf(vocab)
-        v2_m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        tf_m = make_tf(vocab, lora=args.lora, lora_rank=args.lora_rank)
+        v2_m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
         tf_m.label_smoothing = args.label_smooth
         v2_m.label_smoothing = args.label_smooth
         tf_r = train_one(tf_m, tl, vl, args.steps, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         v2_r = train_one(v2_m, tl, vl, args.steps, f"V2_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         last_v2, last_batch = v2_m, next(iter(vl))[0][:4]
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -832,10 +903,10 @@ def mode_memory_ablation(args):
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
-        m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
         m.label_smoothing = args.label_smooth
         train_one(m, tl, vl, args.steps, f"v2_s{seed}", args.log_every,
-                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         batch = next(iter(vl))[0][:4]
         internals_all.append(diagnose_internals(m, batch))
 
@@ -1020,8 +1091,8 @@ def mode_equal_flops(args):
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
         tl, vl, vocab = get_loaders(args, seed)
-        tf = make_tf(vocab, layers=args.tf_layers)
-        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
+        tf = make_tf(vocab, layers=args.tf_layers, lora=args.lora, lora_rank=args.lora_rank)
+        v2 = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
         tf.label_smoothing = args.label_smooth
         v2.label_smoothing = args.label_smooth
         for c in v2.cells:
@@ -1040,9 +1111,9 @@ def mode_equal_flops(args):
               f"FLOPs/step ratio={f_v2/f_tf:.2f}x ({flops_method}; est {f_v2_est/f_tf_est:.2f}x) ---")
         # No early stopping: both models consume the FULL budget (fair FLOPs race).
         tf_r = train_one(tf, tl, vl, steps_tf, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         v2_r = train_one(v2, tl, vl, steps_v2, f"V2_s{seed}", max(50, args.log_every // 2),
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile, think_schedule=args.think_curriculum)
         last_v2 = v2
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -1237,8 +1308,8 @@ def mode_assoc_recall(args):
         return {"best": best, "params": count_params(model), "time_sec": round(time.time() - t0, 2)}
 
     results = {"meta": _meta(args, "assoc_recall"), "models": {}}
-    results["models"]["transformer"] = train_assoc(make_tf(vocab), "TF")
-    results["models"]["hybrid_v2"] = train_assoc(make_tb(vocab, "hybrid_v2", rank=args.think_rank, paths=args.thought_paths), "V2")
+    results["models"]["transformer"] = train_assoc(make_tf(vocab, lora=args.lora, lora_rank=args.lora_rank), "TF")
+    results["models"]["hybrid_v2"] = train_assoc(make_tb(vocab, "hybrid_v2", rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break), "V2")
     tf_a = results["models"]["transformer"]["best"]["acc"]
     v2_a = results["models"]["hybrid_v2"]["best"]["acc"]
     results["summary"] = {
@@ -1388,7 +1459,7 @@ def mode_code_eval(args):
     """
     tl, vl, vocab = get_loaders(args)
     m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
-                rank=args.think_rank, paths=args.thought_paths)
+                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     for c in m.cells:
         c.min_s = args.think_steps
         c.max_s = args.think_steps
@@ -1517,7 +1588,7 @@ def mode_reason_eval(args):
     """Supervised baseline on GSM8K, then reasoning accuracy (self-consistency)."""
     tl, vl, vocab = get_loaders(args)  # --dataset gsm8k
     m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
-                rank=args.think_rank, paths=args.thought_paths)
+                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
@@ -1558,7 +1629,7 @@ def mode_grpo(args):
     vocab = len(w2i)
 
     m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
-                rank=args.think_rank, paths=args.thought_paths)
+                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
     if args.rl_pretrain > 0:
@@ -1632,6 +1703,73 @@ def mode_grpo(args):
     return results
 
 
+def mode_inference_bench(args):
+    """1B-running-cost benchmark: V2 vs TF tokens/sec, FLOPs/token, avg think
+    steps — and the ratio vs a 600B dense reference (2·600e9 FLOPs/token).
+    """
+    tl, vl, vocab = get_loaders(args)
+    batch = next(iter(vl))[0][: args.batch].to(DEVICE)
+    results = {"meta": _meta(args, "inference_bench"), "models": {}}
+    print("\n=== INFERENCE BENCH (running cost) ===")
+    cands = [
+        ("transformer", make_tf(vocab, layers=args.tf_layers, lora=args.lora, lora_rank=args.lora_rank), False),
+        ("hybrid_v2", make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, rank=args.think_rank,
+                              paths=args.thought_paths, train_break=args.train_break), True),
+    ]
+    for name, m, is_v2 in cands:
+        m = maybe_compile(m, args)
+        m.eval()
+        with torch.no_grad():
+            for _ in range(3):  # warmup
+                m(batch)
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        reps = 20
+        t0 = time.time()
+        with torch.no_grad():
+            for _ in range(reps):
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp and DEVICE == "cuda"):
+                    m(batch)
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        dt = (time.time() - t0) / reps
+        fwd = measure_fwd_flops(m, args.seq_len, train_mode=False) or estimate_fwd_flops(m)
+        flops_per_token = fwd / args.seq_len
+        avg_steps = None
+        if is_v2:
+            orig = getattr(m, "_orig_mod", m)
+            s = sum(c._steps_sum for c in orig.cells)
+            n = sum(c._steps_n for c in orig.cells)
+            avg_steps = round(s / n, 2) if n > 0 else None
+        results["models"][name] = {
+            "params": count_params(m), "trainable": trainable_params(m),
+            "tokens_per_sec": round(batch.numel() / dt, 1),
+            "flops_per_token": int(flops_per_token),
+            "avg_think_steps": avg_steps,
+            "ms_per_batch": round(dt * 1000, 2),
+        }
+        print(f"  {name:12s} params={count_params(m):,} tok/s={batch.numel() / dt:.0f} "
+              f"FLOPs/tok={flops_per_token / 1e6:.0f}M avg_steps={avg_steps}")
+    ref600 = 2 * 600e9  # dense 600B inference ≈ 2·N FLOPs per token
+    v2 = results["models"]["hybrid_v2"]
+    tf = results["models"]["transformer"]
+    results["summary"] = {
+        "v2_flops_per_token": v2["flops_per_token"],
+        "v2_vs_600b_dense_cost": round(ref600 / v2["flops_per_token"], 1) if v2["flops_per_token"] else None,
+        "v2_vs_tf_flops_per_token": round(v2["flops_per_token"] / max(tf["flops_per_token"], 1), 2),
+        "v2_vs_tf_tokens_per_sec": round(tf["tokens_per_sec"] / max(v2["tokens_per_sec"], 1e-6), 2),
+    }
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    print(f"V2 FLOPs/token: {v2['flops_per_token'] / 1e6:.0f}M | 600B-dense: 1,200,000M")
+    print(f"V2 running cost vs 600B-dense: {results['summary']['v2_vs_600b_dense_cost']}x cheaper per token")
+    print(f"V2 vs TF: FLOPs/tok {results['summary']['v2_vs_tf_flops_per_token']}x, tok/s {results['summary']['v2_vs_tf_tokens_per_sec']}x (1.0 = TF)")
+    print("1B-running-cost = structurally true (small params); accuracy needs benchmarks (GSM8K/HumanEval).")
+    _save(results, "inference_bench")
+    return results
+
+
 def _meta(args, mode):
     return {
         "mode": mode,
@@ -1700,7 +1838,7 @@ def main():
         choices=[
             "race", "diagnose", "think_scale", "verify_claim",
             "memory_ablation", "equal_flops", "assoc_recall",
-            "code_eval", "reason_eval", "grpo",
+            "code_eval", "reason_eval", "grpo", "inference_bench",
         ],
         default="race",
     )
@@ -1751,6 +1889,12 @@ def main():
                    help="self-consistency: sample N answers per problem, majority vote")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile (CUDA graphs) — big speedup for the sequential think loop / generation")
+    p.add_argument("--train_break", type=float, default=0.8,
+                   help="training confidence break (lower = think exits earlier = faster wall-clock; 0.5-0.6 typical for speed)")
+    p.add_argument("--think_curriculum", type=str, default=None,
+                   help="think-step curriculum across the budget, e.g. '1,2,4,8' (early cheap, late expensive)")
+    p.add_argument("--lora", action="store_true", help="LoRA the transformer baseline (frozen base + adapters)")
+    p.add_argument("--lora_rank", type=int, default=8, help="LoRA rank for the transformer baseline")
     args = p.parse_args()
     if args.verify:
         verify()
@@ -1766,6 +1910,7 @@ def main():
         "code_eval": mode_code_eval,
         "reason_eval": mode_reason_eval,
         "grpo": mode_grpo,
+        "inference_bench": mode_inference_bench,
     }
     modes[args.mode](args)
 

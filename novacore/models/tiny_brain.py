@@ -64,6 +64,9 @@ class TinyBrainConfig:
     # their residuals. Maps Grok-style coordinator + specialist agents into a
     # single forward pass. K=1 is the current single-trajectory behavior.
     num_thought_paths: int = 1
+    # Training-time confidence break: lower ⇒ think loop exits earlier on easy
+    # tokens ⇒ fewer avg steps ⇒ faster wall-clock (adaptive compute in training).
+    train_break: float = 0.8
 
 
 class ThinkingStep(nn.Module):
@@ -261,6 +264,10 @@ class AdaptiveThinkingCell(nn.Module):
         self.ls = config.step_penalty_weight
         self.ld = config.diversity_weight
         self.n_paths = max(1, config.num_thought_paths)
+        self.train_break = config.train_break
+        # avg think-step accounting (wall-clock / adaptive-compute visibility)
+        self._steps_sum = 0
+        self._steps_n = 0
         # Coordinator: how much each thought path's residual contributes.
         self.path_gate = nn.Linear(d, self.n_paths, bias=False) if self.n_paths > 1 else None
         if self.path_gate is not None:
@@ -293,8 +300,10 @@ class AdaptiveThinkingCell(nn.Module):
             if t >= self.min_s - 1:
                 if not self.training and h.mean() > 0.5:
                     break
-                if self.training and h.mean() > 0.8:
+                if self.training and h.mean() > self.train_break:
                     break
+        self._steps_sum += steps
+        self._steps_n += 1
         return x, memory, steps, csum, div_pen, trace
 
     def forward(self, x, memory=None, return_trace: bool = False):

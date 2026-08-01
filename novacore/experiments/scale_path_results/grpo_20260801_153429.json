@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "mode": "grpo",
+    "device": "cpu",
+    "steps": 2,
+    "batch": 8,
+    "samples": 24,
+    "dataset": "gsm8k",
+    "data_mix": null,
+    "seq_len": 64,
+    "thought_paths": 1,
+    "label_smooth": 0.0,
+    "amp": false,
+    "rl_steps": 2,
+    "rollouts": 2,
+    "rl_lr": 5e-06,
+    "rl_kl": 0.1,
+    "reason_samples": 1,
+    "lr": 0.001,
+    "warmup_fraction": 0.3,
+    "seeds": "0",
+    "timestamp": "2026-08-01T15:34:29",
+    "cuda_name": null,
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "multi_agent": "mixture-of-thoughts: parallel specialist paths + coordinator gate (Grok-style)",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "rl_hist": [
+    {
+      "step": 1,
+      "loss": -0.0026,
+      "hit": 1
+    },
+    {
+      "step": 2,
+      "loss": -0.0029,
+      "hit": 1
+    }
+  ],
+  "gsm8k_acc_after_rl": 0.0,
+  "n_test": 24,
+  "rl_lr": 5e-06,
+  "rollouts": 2,
+  "rl_kl": 0.1
+}

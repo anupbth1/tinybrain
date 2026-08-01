@@ -1670,7 +1670,9 @@ def mode_grpo(args):
         _GSM.update({"w2i": w2i, "i2w": i2w, "test_prompts": t_p, "test_answers": t_a})
     vocab = len(w2i)
 
-    m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
+    rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
+    sft_think = rl_think  # SFT at rollout depth so the model emits the '####' format during rollouts
+    m = make_tb(vocab, "hybrid_v2", think_steps=sft_think, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
@@ -1679,7 +1681,7 @@ def mode_grpo(args):
         orig = getattr(m, "_orig_mod", m)
         orig.load_state_dict(torch.load(args.load_path, map_location=DEVICE))
     elif args.rl_pretrain > 0:
-        print(f"\n=== SFT warmup ({args.rl_pretrain} steps) ===")
+        print(f"\n=== SFT warmup ({args.rl_pretrain} steps, think depth {sft_think}) ===")
         texts = [q + " " + a for q, a in zip(prompts, answers)]
         data = _texts_to_data(texts, w2i, args.seq_len)
         split = int(len(data) * 0.9)
@@ -1691,10 +1693,8 @@ def mode_grpo(args):
             orig = getattr(m, "_orig_mod", m)
             torch.save(orig.state_dict(), args.save_path)
             print(f"  SFT weights saved to {args.save_path}")
-
-    rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
     if rl_think != args.think_steps:
-        print(f"  rollouts will run at think depth {rl_think} (eval stays at {args.think_steps})")
+        print(f"  SFT+RL at think depth {rl_think}; eval will run at {args.think_steps}")
 
     ref = copy.deepcopy(m).eval()
     opt = torch.optim.AdamW(m.parameters(), lr=args.rl_lr, weight_decay=0.0)
@@ -1712,10 +1712,7 @@ def mode_grpo(args):
         for i in idx.tolist():
             qids.append(_word_encode(prompts[i], w2i))
             answers_b.append(answers[i])
-        # K rollouts per prompt, all in ONE batched generation call (think depth = rl_think)
-        if rl_think != args.think_steps:
-            for c in m.cells:
-                c.min_s = c.max_s = rl_think
+        # K rollouts per prompt, all in ONE batched generation call (cells are at rl_think)
         roll_prompts = [q for q in qids for _ in range(K)]
         roll_gold = [a for a in answers_b for _ in range(K)]
         full = generate_batch(m, roll_prompts, max_new=rl_max, temp=args.rl_temp)
@@ -1732,9 +1729,6 @@ def mode_grpo(args):
         # one batched log-prob forward for policy + reference (same think depth)
         lps = rollout_logprobs_batch(m, roll_prompts, gens)
         lprefs = rollout_logprobs_batch(ref, roll_prompts, gens)
-        if rl_think != args.think_steps:
-            for c in m.cells:
-                c.min_s = c.max_s = args.think_steps
         total = 0.0
         for (p, g), adv, lp, lpref in zip(zip(roll_prompts, gens), advs, lps, lprefs):
             # per-token normalization keeps the KL term stable across lengths
@@ -1752,6 +1746,9 @@ def mode_grpo(args):
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
                   f"hit={hit}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
 
+    # eval at the full think depth
+    for c in m.cells:
+        c.min_s = c.max_s = args.think_steps
     acc = eval_gsm8k(m, args, w2i, i2w)
     results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
                "gsm8k_acc_after_rl": round(acc, 4), "n_test": len(_GSM["test_prompts"]),

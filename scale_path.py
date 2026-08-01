@@ -149,8 +149,12 @@ def load_wikitext(max_samples=20000, seq_len=64, top_k=20000):
 
 
 def load_openwebtext(max_samples=20000, seq_len=64, top_k=20000):
-    """OpenWebText subset via streaming (downloads shards on the fly)."""
-    ds = _hf_load("openwebtext", split="train", streaming=True)
+    """OpenWebText subset via streaming (downloads shards on the fly).
+
+    Note: the bare repo id 'openwebtext' fails on newer datasets versions
+    (HfUriError) — the canonical namespace/name id is Skylion007/openwebtext.
+    """
+    ds = _hf_load("Skylion007/openwebtext", split="train", streaming=True)
     texts = []
     for ex in ds:
         t = ex["text"].strip()
@@ -1193,7 +1197,9 @@ def main():
     p.add_argument("--think_rank", type=int, default=None,
                    help="low-rank think branches (r < hidden_size) — much cheaper thinking; None = full d×d (default)")
     p.add_argument("--ema", type=float, default=0.0,
-                   help="EMA decay for weights (0=off; 0.999 typical). Val is evaluated on EMA weights.")
+                   help="EMA decay for weights (0=off). Only helps NEAR CONVERGENCE: "
+                        "use 0.99 for short runs (~100-step window), 0.999 needs 10k+ steps. "
+                        "Val is evaluated on EMA weights.")
     args = p.parse_args()
     if args.verify:
         verify()

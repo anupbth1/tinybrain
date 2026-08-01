@@ -80,11 +80,17 @@ rl_args = argparse.Namespace(
     seeds="0", steps=2, batch=8, samples=24, dataset="gsm8k", data_mix=None, seq_len=64,
     thought_paths=1, label_smooth=0.0, amp=False, log_every=10, memory_sharp=None, lr=1e-3,
     warmup=0.3, early_stop=0, think_steps=2, tf_layers=3, think_rank=None, ema=0.0,
-    max_new=16, rl_steps=2, rollouts=2, rl_lr=1e-4, rl_temp=0.9, rl_kl=0.01,
-    rl_pretrain=2, reason_samples=1,
+    max_new=16, rl_steps=2, rollouts=2, rl_batch=4, rl_max_new=12, rl_lr=1e-4, rl_temp=0.9,
+    rl_kl=0.01, rl_pretrain=2, reason_samples=1, compile=False,
 )
 res = sp.mode_grpo(rl_args)
 assert "gsm8k_acc_after_rl" in res
 print("GRPO loop OK, acc_after_rl =", res["gsm8k_acc_after_rl"])
+
+# 6) generate_batch: all sequences advance in lockstep, same length
+mm2 = make_tb(VOCAB, "hybrid_v2", think_steps=2)
+gb = sp.generate_batch(mm2, [[3, 4], [5, 6, 7]], max_new=6, temp=0.0)
+print("generate_batch lens:", [len(g) for g in gb])
+assert len(gb) == 2 and all(len(g) >= 6 for g in gb)
 
 print("ALL_SMOKE_OK")

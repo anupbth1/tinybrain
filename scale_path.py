@@ -1273,6 +1273,78 @@ def rollout_logprobs(model, prompt_ids, gen_ids):
     return lp
 
 
+def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, device=DEVICE):
+    """Batched autoregressive generation — all sequences advance in lockstep.
+
+    Turns B×K sequential forwards into ONE batched forward per token, which is
+    10-50x faster on small models (the reason GRPO felt 'too slow' before).
+    Returns full id lists (prompt + generation) for every sequence.
+    """
+    model.eval()
+    B = len(prompt_ids_list)
+    max_p = max(len(p) for p in prompt_ids_list)
+    cur = torch.zeros(B, max_p, dtype=torch.long, device=device)
+    for i, p in enumerate(prompt_ids_list):
+        cur[i, :len(p)] = torch.tensor(p, dtype=torch.long, device=device)
+    gens = [[] for _ in range(B)]
+    done = [False] * B
+    for _ in range(max_new):
+        if all(done):
+            break
+        with torch.no_grad():
+            logits = model(cur)["logits"][:, -1]
+        if temp > 0:
+            logits = logits / max(temp, 1e-6)
+            probs = F.softmax(logits, dim=-1)
+            if top_p < 1.0:
+                sorted_p, sorted_idx = probs.sort(descending=True)
+                cum = sorted_p.cumsum(1)
+                kept = sorted_p * ((cum - sorted_p) <= top_p)
+                kept = kept / kept.sum(1, keepdim=True)
+                nxt = sorted_idx.gather(1, torch.multinomial(kept, 1))[:, 0]
+            else:
+                nxt = torch.multinomial(probs, 1)[:, 0]
+        else:
+            nxt = logits.argmax(dim=-1)
+        for i in range(B):
+            if not done[i]:
+                gens[i].append(int(nxt[i].item()))
+                if nxt[i].item() == 2:
+                    done[i] = True
+        nxt = nxt * torch.tensor([not d for d in done], device=device).long()
+        cur = torch.cat([cur, nxt.unsqueeze(1)], dim=1)
+    return [prompt_ids_list[i] + gens[i] for i in range(B)]
+
+
+def rollout_logprobs_batch(model, prompt_ids_list, gen_ids_list):
+    """Per-rollout summed log-probs in ONE padded forward (grad enabled)."""
+    B = len(prompt_ids_list)
+    max_len = max(len(p) + len(g) for p, g in zip(prompt_ids_list, gen_ids_list))
+    full = torch.zeros(B, max_len, dtype=torch.long, device=DEVICE)
+    starts = []
+    for i, (p, g) in enumerate(zip(prompt_ids_list, gen_ids_list)):
+        full[i, :len(p) + len(g)] = torch.tensor(p + g, dtype=torch.long, device=DEVICE)
+        starts.append(len(p))
+    logits = model(full)["logits"]  # (B, maxL, V)
+    lps = torch.zeros(B, device=DEVICE)
+    for i, (p, g) in enumerate(zip(prompt_ids_list, gen_ids_list)):
+        lg = F.log_softmax(logits[i], dim=-1)
+        s = starts[i]
+        for j, tgt in enumerate(g):
+            lps[i] = lps[i] + lg[s - 1 + j, tgt]
+    return lps
+
+
+def maybe_compile(model, args):
+    """torch.compile (kernel fusion / CUDA graphs) with safe fallback."""
+    if getattr(args, "compile", False):
+        try:
+            return torch.compile(model, mode="reduce-overhead")
+        except Exception as e:
+            print(f"  torch.compile unavailable: {e}")
+    return model
+
+
 def _check_code(code, test, timeout=3.0):
     """Execute prompt+completion+asserts in a subprocess; True iff exit 0."""
     import subprocess
@@ -1299,6 +1371,7 @@ def mode_code_eval(args):
         c.min_s = args.think_steps
         c.max_s = args.think_steps
     m.label_smoothing = args.label_smooth
+    m = maybe_compile(m, args)
     tr = train_one(m, tl, vl, args.steps, "code_model", args.log_every,
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
                    amp=args.amp, seq_len=args.seq_len)
@@ -1390,26 +1463,31 @@ def _num_match(pred, gold):
 
 
 def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
-    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency)."""
+    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency).
+
+    Generation is BATCHED (all problems at once) so eval is not a bottleneck.
+    """
     from collections import Counter
     if prompts is None:
         prompts, answers = _GSM["test_prompts"], _GSM["test_answers"]
     if w2i is None:
         w2i, i2w = _GSM["w2i"], _GSM["i2w"]
+    sample = max(1, args.reason_samples)
+    chunk = 256 if sample == 1 else max(32, 256 // sample)
     correct, total = 0, 0
-    for q, a in zip(prompts, answers):
-        qid = _word_encode(q, w2i)
-        preds = []
-        for _ in range(max(1, args.reason_samples)):
-            gen = generate(model, None, qid, max_new=args.max_new, context=args.seq_len,
-                           temp=0.6 if args.reason_samples > 1 else 0.0)
-            text = _word_decode(gen[len(qid):], i2w)
-            preds.append(_gsm8k_ans(text))
-        best = Counter(preds).most_common(1)[0][0]
-        correct += int(_num_match(best, _gsm8k_ans(a)))
-        total += 1
-        if total % 200 == 0:
-            print(f"  gsm8k {total}/{len(prompts)} acc={correct / total:.4f}")
+    for c0 in range(0, len(prompts), chunk):
+        chunk_p = prompts[c0:c0 + chunk]
+        chunk_a = answers[c0:c0 + chunk]
+        qids = [_word_encode(q, w2i) for q in chunk_p]
+        # sample self-consistency copies of the whole chunk
+        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=0.0)
+                   for _ in range(sample)]
+        for i in range(len(chunk_p)):
+            preds = [_word_decode(gen_i[len(qids[i]):], i2w) for gen_i in (g[i] for g in all_ids)]
+            best = Counter(_gsm8k_ans(p) for p in preds).most_common(1)[0][0]
+            correct += int(_num_match(best, _gsm8k_ans(chunk_a[i])))
+            total += 1
+        print(f"  gsm8k {total}/{len(prompts)} acc={correct / max(total, 1):.4f}")
     return correct / max(total, 1)
 
 
@@ -1419,6 +1497,7 @@ def mode_reason_eval(args):
     m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths)
     m.label_smoothing = args.label_smooth
+    m = maybe_compile(m, args)
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
                    amp=args.amp, seq_len=args.seq_len)
@@ -1459,6 +1538,7 @@ def mode_grpo(args):
     m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths)
     m.label_smoothing = args.label_smooth
+    m = maybe_compile(m, args)
     if args.rl_pretrain > 0:
         print(f"\n=== SFT warmup ({args.rl_pretrain} steps) ===")
         texts = [q + " " + a for q, a in zip(prompts, answers)]
@@ -1472,39 +1552,50 @@ def mode_grpo(args):
     ref = copy.deepcopy(m).eval()
     opt = torch.optim.AdamW(m.parameters(), lr=args.rl_lr, weight_decay=0.0)
     K = max(2, args.rollouts)
+    rl_batch = max(1, args.rl_batch)
+    rl_max = args.rl_max_new
     print("\n=== GRPO RL ===")
-    print(f"prompts={len(prompts)} rollouts={K} steps={args.rl_steps} kl={args.rl_kl} temp={args.rl_temp}")
+    print(f"prompts={len(prompts)} rollouts={K} rl_batch={rl_batch} steps={args.rl_steps} "
+          f"kl={args.rl_kl} temp={args.rl_temp} max_new={rl_max}")
     hist = []
+    t0 = time.time()
     for step in range(args.rl_steps):
-        idx = torch.randperm(len(prompts))[: args.batch]
-        batch_pts = []
+        idx = torch.randperm(len(prompts))[: rl_batch]
+        qids, answers_b = [], []
         for i in idx.tolist():
-            q, a = prompts[i], answers[i]
-            qid = _word_encode(q, w2i)
-            rws = []
-            for _ in range(K):
-                gen = generate(m, None, qid, max_new=args.max_new, context=args.seq_len, temp=args.rl_temp)
-                text = _word_decode(gen[len(qid):], i2w)
-                r = 1.0 if _num_match(_gsm8k_ans(text), _gsm8k_ans(a)) else 0.0
-                rws.append((gen[len(qid):], r))
-            mean = sum(r for _, r in rws) / K
-            std = (sum((r - mean) ** 2 for _, r in rws) / K) ** 0.5
-            for g, r in rws:
-                batch_pts.append((qid, g, (r - mean) / (std + 1e-4)))
-        total = 0.0
-        for qid, g, adv in batch_pts:
-            lp = rollout_logprobs(m, qid, g)
-            lpref = rollout_logprobs(ref, qid, g)
-            total = total + (-(adv * lp) + args.rl_kl * (lp - lpref))
-        loss = total / len(batch_pts)
+            qids.append(_word_encode(prompts[i], w2i))
+            answers_b.append(answers[i])
+        # K rollouts per prompt, all in ONE batched generation call
+        roll_prompts = [q for q in qids for _ in range(K)]
+        roll_gold = [a for a in answers_b for _ in range(K)]
+        full = generate_batch(m, roll_prompts, max_new=rl_max, temp=args.rl_temp)
+        gens = [f[len(p):] for f, p in zip(full, roll_prompts)]
+        rewards = [1.0 if _num_match(_gsm8k_ans(_word_decode(g, i2w)), _gsm8k_ans(a))
+                   else 0.0 for g, a in zip(gens, roll_gold)]
+        # group-relative advantage per prompt (K rollouts per group)
+        advs = []
+        for k0 in range(0, len(rewards), K):
+            grp = rewards[k0:k0 + K]
+            mean = sum(grp) / K
+            std = (sum((r - mean) ** 2 for r in grp) / K) ** 0.5
+            advs += [(r - mean) / (std + 1e-4) for r in grp]
+        # one batched log-prob forward for policy + reference
+        lps = rollout_logprobs_batch(m, roll_prompts, gens)
+        lprefs = rollout_logprobs_batch(ref, roll_prompts, gens)
+        total = sum(-(adv * lp) + args.rl_kl * (lp - lpref)
+                    for adv, lp, lpref in zip(advs, lps, lprefs))
+        loss = total / len(advs)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step()
-        hit = sum(1 for _, _, adv in batch_pts if adv > 0)
-        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "pos_adv": hit})
-        if (step + 1) % 10 == 0 or step + 1 == args.rl_steps:
-            print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} pos_adv={hit}/{len(batch_pts)}")
+        hit = sum(1 for r in rewards if r > 0)
+        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "hit": hit})
+        if (step + 1) % 5 == 0 or step + 1 == args.rl_steps:
+            el = time.time() - t0
+            eta = el / (step + 1) * (args.rl_steps - step - 1)
+            print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
+                  f"hit={hit}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
 
     acc = eval_gsm8k(m, args, w2i, i2w)
     results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
@@ -1627,13 +1718,17 @@ def main():
                    help="bf16 autocast (Ampere+) — ~2x wall-clock on the sequential think loop")
     p.add_argument("--max_new", type=int, default=200, help="max generated tokens in code_eval")
     p.add_argument("--rl_steps", type=int, default=60, help="GRPO optimization steps")
-    p.add_argument("--rollouts", type=int, default=6, help="rollouts per prompt in GRPO")
+    p.add_argument("--rollouts", type=int, default=4, help="rollouts per prompt in GRPO")
+    p.add_argument("--rl_batch", type=int, default=8, help="prompts per GRPO step (rollouts are batched)")
+    p.add_argument("--rl_max_new", type=int, default=160, help="max rollout tokens in GRPO (keep small for speed)")
     p.add_argument("--rl_lr", type=float, default=1e-5, help="policy LR for RL (small!)")
     p.add_argument("--rl_temp", type=float, default=0.8, help="rollout sampling temperature")
     p.add_argument("--rl_kl", type=float, default=0.01, help="KL penalty coefficient vs reference policy")
     p.add_argument("--rl_pretrain", type=int, default=300, help="supervised warmup steps before RL")
     p.add_argument("--reason_samples", type=int, default=1,
                    help="self-consistency: sample N answers per problem, majority vote")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile (CUDA graphs) — big speedup for the sequential think loop / generation")
     args = p.parse_args()
     if args.verify:
         verify()

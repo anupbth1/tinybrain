@@ -21,6 +21,8 @@ Usage (Colab/RunPod — use ! in notebook cells):
   !python scale_path.py --mode equal_flops --dataset code --seq_len 512 --think_steps 8  # code data
   !python scale_path.py --mode code_eval --dataset code --seq_len 512 --think_steps 8 --amp  # HumanEval pass@1
   !python scale_path.py --mode equal_flops --data_mix tinystories:0.5,wikitext:0.3,openwebtext:0.2  # replay-style
+  !python scale_path.py --mode reason_eval --dataset gsm8k --seq_len 128 --think_steps 8  # supervised baseline
+  !python scale_path.py --mode grpo --dataset gsm8k --seq_len 128 --think_steps 8 --rl_steps 60  # R1-style RL
 
 Fairness defaults: LR schedule keyed to TOKENS (warmup+cosine), equal-FLOPs
 compares BEST val with paired t-test/sign test over seeds, full budget per
@@ -592,6 +594,8 @@ def get_loaders(args, seed=0):
         data, vocab = load_openwebtext(args.samples, args.seq_len)
     elif args.dataset == "code":
         data, vocab = load_code(args.samples, args.seq_len)
+    elif args.dataset == "gsm8k":
+        data, vocab = load_gsm8k_lm(args.samples, args.seq_len)
     else:
         data, vocab = load_tinystories(args.samples, args.seq_len)
     split = int(len(data) * 0.9)
@@ -1232,18 +1236,41 @@ def mode_assoc_recall(args):
 
 
 @torch.no_grad()
-def generate(model, tok, prompt_ids, max_new=200, context=512, device=DEVICE):
-    """Greedy autoregressive completion for code_eval."""
+def generate(model, tok, prompt_ids, max_new=200, context=512, temp=0.0, top_p=1.0, device=DEVICE):
+    """Autoregressive completion. temp=0 → greedy; temp>0 → sampling (top_p)."""
     model.eval()
     ids = list(prompt_ids)
     for _ in range(max_new):
         x = torch.tensor([ids[-context:]], device=device)
         logits = model(x)["logits"][0, -1]
-        nxt = int(logits.argmax().item())
+        if temp > 0:
+            logits = logits / max(temp, 1e-6)
+            probs = F.softmax(logits, dim=-1)
+            if top_p < 1.0:
+                sorted_p, sorted_idx = probs.sort(descending=True)
+                cum = sorted_p.cumsum(0)
+                keep = (cum - sorted_p) <= top_p
+                kept = sorted_p * keep
+                kept = kept / kept.sum()
+                nxt = int(sorted_idx[torch.multinomial(kept, 1).item()].item())
+            else:
+                nxt = int(torch.multinomial(probs, 1).item())
+        else:
+            nxt = int(logits.argmax().item())
         ids.append(nxt)
         if nxt == 2:  # <eos> where available
             break
     return ids
+
+
+def rollout_logprobs(model, prompt_ids, gen_ids):
+    """Sum of log π(gen | prefix) via ONE teacher-forced forward (grad enabled)."""
+    full = torch.tensor([prompt_ids + gen_ids], device=DEVICE)
+    logits = model(full)["logits"][0]  # (L, V)
+    lp = 0.0
+    for pos, tgt in enumerate(gen_ids):
+        lp = lp + F.log_softmax(logits[len(prompt_ids) - 1 + pos], dim=-1)[tgt]
+    return lp
 
 
 def _check_code(code, test, timeout=3.0):
@@ -1307,6 +1334,191 @@ def mode_code_eval(args):
     return results
 
 
+# ── GSM8K reasoning: supervised baseline, GRPO RL, self-consistency eval ──
+
+_GSM = {"w2i": None, "i2w": None, "test_prompts": [], "test_answers": []}
+
+
+def load_gsm8k(max_samples=20000, split="train"):
+    ds = _hf_load("openai/gsm8k", config="main", split=split)
+    prompts, answers = [], []
+    for ex in ds:
+        prompts.append(ex["question"].strip())
+        answers.append(ex["answer"].strip())  # "... #### 123"
+        if len(prompts) >= max_samples:
+            break
+    return prompts, answers
+
+
+def load_gsm8k_lm(max_samples=10000, seq_len=128):
+    """GSM8K as LM data (question + answer) for supervised warmup/baseline."""
+    global _GSM
+    prompts, answers = load_gsm8k(max_samples, "train")
+    t_p, t_a = load_gsm8k(5000, "test")
+    w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000)
+    _GSM.update({"w2i": w2i, "i2w": {v: k for k, v in w2i.items()},
+                 "test_prompts": t_p, "test_answers": t_a})
+    texts = [q + " " + a for q, a in zip(prompts, answers)]
+    data = _texts_to_data(texts, w2i, seq_len)
+    print(f"  gsm8k: {len(data)} seqs vocab={len(w2i)}")
+    return data, len(w2i)
+
+
+def _word_encode(text, w2i):
+    return [w2i.get(w, 1) for w in text.lower().split()]
+
+
+def _word_decode(ids, i2w):
+    return " ".join(i2w.get(i, "") for i in ids)
+
+
+def _gsm8k_ans(text):
+    return text.split("####")[-1].strip() if "####" in text else text.strip()
+
+
+def _num_match(pred, gold):
+    def norm(s):
+        s = s.replace(",", "").strip()
+        try:
+            return round(float(s), 4)
+        except Exception:
+            return None
+    p, g = norm(pred), norm(gold)
+    if p is not None and g is not None:
+        return abs(p - g) < 1e-3
+    return pred == gold
+
+
+def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
+    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency)."""
+    from collections import Counter
+    if prompts is None:
+        prompts, answers = _GSM["test_prompts"], _GSM["test_answers"]
+    if w2i is None:
+        w2i, i2w = _GSM["w2i"], _GSM["i2w"]
+    correct, total = 0, 0
+    for q, a in zip(prompts, answers):
+        qid = _word_encode(q, w2i)
+        preds = []
+        for _ in range(max(1, args.reason_samples)):
+            gen = generate(model, None, qid, max_new=args.max_new, context=args.seq_len,
+                           temp=0.6 if args.reason_samples > 1 else 0.0)
+            text = _word_decode(gen[len(qid):], i2w)
+            preds.append(_gsm8k_ans(text))
+        best = Counter(preds).most_common(1)[0][0]
+        correct += int(_num_match(best, _gsm8k_ans(a)))
+        total += 1
+        if total % 200 == 0:
+            print(f"  gsm8k {total}/{len(prompts)} acc={correct / total:.4f}")
+    return correct / max(total, 1)
+
+
+def mode_reason_eval(args):
+    """Supervised baseline on GSM8K, then reasoning accuracy (self-consistency)."""
+    tl, vl, vocab = get_loaders(args)  # --dataset gsm8k
+    m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
+                rank=args.think_rank, paths=args.thought_paths)
+    m.label_smoothing = args.label_smooth
+    tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
+                   early_stop_patience_steps=args.early_stop, lr=args.lr,
+                   amp=args.amp, seq_len=args.seq_len)
+    acc = eval_gsm8k(m, args)
+    results = {"meta": _meta(args, "reason_eval"), "train": tr,
+               "gsm8k_acc": round(acc, 4), "n_test": len(_GSM["test_prompts"]),
+               "reason_samples": args.reason_samples}
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    print(f"GSM8K accuracy: {acc:.4f} ({results['n_test']} problems, samples={args.reason_samples})")
+    print("Supervised baseline — now compare against --mode grpo (RL).")
+    _save(results, "reason_eval")
+    return results
+
+
+def mode_grpo(args):
+    """R1-style RL: teach the model WHEN to think and how to verify.
+
+    Group Relative Policy Optimization: sample K rollouts per prompt, score by
+    GSM8K exact match, normalize rewards within the group, then
+    L = -adv·logπ + β·KL(π‖π_ref). This is what turns a 'can think' model
+    into a 'does think' reasoner at small compute.
+    """
+    import copy
+    prompts, answers = load_gsm8k(args.samples, "train")
+    w2i = _word_vocab(prompts + answers, top_k=20000)
+    i2w = {v: k for k, v in w2i.items()}
+    if _GSM["test_prompts"]:
+        _GSM.update({"w2i": w2i, "i2w": i2w})
+    else:  # ensure test set + vocab coverage
+        t_p, t_a = load_gsm8k(5000, "test")
+        w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000)
+        i2w = {v: k for k, v in w2i.items()}
+        _GSM.update({"w2i": w2i, "i2w": i2w, "test_prompts": t_p, "test_answers": t_a})
+    vocab = len(w2i)
+
+    m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
+                rank=args.think_rank, paths=args.thought_paths)
+    m.label_smoothing = args.label_smooth
+    if args.rl_pretrain > 0:
+        print(f"\n=== SFT warmup ({args.rl_pretrain} steps) ===")
+        texts = [q + " " + a for q, a in zip(prompts, answers)]
+        data = _texts_to_data(texts, w2i, args.seq_len)
+        split = int(len(data) * 0.9)
+        tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len), batch_size=args.batch, shuffle=True)
+        vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len), batch_size=args.batch)
+        train_one(m, tl, vl, args.rl_pretrain, "sft", max(20, args.log_every // 4),
+                  lr=args.lr, amp=args.amp, seq_len=args.seq_len)
+
+    ref = copy.deepcopy(m).eval()
+    opt = torch.optim.AdamW(m.parameters(), lr=args.rl_lr, weight_decay=0.0)
+    K = max(2, args.rollouts)
+    print("\n=== GRPO RL ===")
+    print(f"prompts={len(prompts)} rollouts={K} steps={args.rl_steps} kl={args.rl_kl} temp={args.rl_temp}")
+    hist = []
+    for step in range(args.rl_steps):
+        idx = torch.randperm(len(prompts))[: args.batch]
+        batch_pts = []
+        for i in idx.tolist():
+            q, a = prompts[i], answers[i]
+            qid = _word_encode(q, w2i)
+            rws = []
+            for _ in range(K):
+                gen = generate(m, None, qid, max_new=args.max_new, context=args.seq_len, temp=args.rl_temp)
+                text = _word_decode(gen[len(qid):], i2w)
+                r = 1.0 if _num_match(_gsm8k_ans(text), _gsm8k_ans(a)) else 0.0
+                rws.append((gen[len(qid):], r))
+            mean = sum(r for _, r in rws) / K
+            std = (sum((r - mean) ** 2 for _, r in rws) / K) ** 0.5
+            for g, r in rws:
+                batch_pts.append((qid, g, (r - mean) / (std + 1e-4)))
+        total = 0.0
+        for qid, g, adv in batch_pts:
+            lp = rollout_logprobs(m, qid, g)
+            lpref = rollout_logprobs(ref, qid, g)
+            total = total + (-(adv * lp) + args.rl_kl * (lp - lpref))
+        loss = total / len(batch_pts)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+        opt.step()
+        hit = sum(1 for _, _, adv in batch_pts if adv > 0)
+        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "pos_adv": hit})
+        if (step + 1) % 10 == 0 or step + 1 == args.rl_steps:
+            print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} pos_adv={hit}/{len(batch_pts)}")
+
+    acc = eval_gsm8k(m, args, w2i, i2w)
+    results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
+               "gsm8k_acc_after_rl": round(acc, 4), "n_test": len(_GSM["test_prompts"]),
+               "rl_lr": args.rl_lr, "rollouts": K, "rl_kl": args.rl_kl}
+    print("\n" + "=" * 64)
+    print("RESULTS (copy this block back)")
+    print("=" * 64)
+    print(f"GSM8K accuracy after GRPO: {acc:.4f} ({results['n_test']} problems)")
+    print("Compare vs --mode reason_eval (supervised) — RL should win on reasoning.")
+    _save(results, "grpo")
+    return results
+
+
 def _meta(args, mode):
     return {
         "mode": mode,
@@ -1320,6 +1532,11 @@ def _meta(args, mode):
         "thought_paths": getattr(args, "thought_paths", 1),
         "label_smooth": getattr(args, "label_smooth", 0.0),
         "amp": getattr(args, "amp", False),
+        "rl_steps": getattr(args, "rl_steps", 0),
+        "rollouts": getattr(args, "rollouts", 0),
+        "rl_lr": getattr(args, "rl_lr", 1e-5),
+        "rl_kl": getattr(args, "rl_kl", 0.01),
+        "reason_samples": getattr(args, "reason_samples", 1),
         "lr": getattr(args, "lr", 3e-4),
         "warmup_fraction": getattr(args, "warmup", 0.02),
         "seeds": args.seeds,
@@ -1370,6 +1587,7 @@ def main():
         choices=[
             "race", "diagnose", "think_scale", "verify_claim",
             "memory_ablation", "equal_flops", "assoc_recall",
+            "code_eval", "reason_eval", "grpo",
         ],
         default="race",
     )
@@ -1378,8 +1596,8 @@ def main():
     p.add_argument("--samples", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=200)
     p.add_argument("--seeds", type=str, default="0,1,2", help="comma seeds for multi-seed modes")
-    p.add_argument("--dataset", choices=["tinystories", "wikitext", "openwebtext", "code"], default="tinystories",
-                   help="tinystories | wikitext (WikiText-2 raw) | openwebtext (streaming) | code (BPE, for code_eval)")
+    p.add_argument("--dataset", choices=["tinystories", "wikitext", "openwebtext", "code", "gsm8k"], default="tinystories",
+                   help="tinystories | wikitext | openwebtext | code (BPE) | gsm8k (reasoning)")
     p.add_argument("--data_mix", type=str, default=None,
                    help="blend word datasets into one shared vocab, e.g. tinystories:0.5,wikitext:0.3,openwebtext:0.2 "
                         "(replay-style: avoids overfitting the newest corpus)")
@@ -1408,6 +1626,14 @@ def main():
     p.add_argument("--amp", action="store_true",
                    help="bf16 autocast (Ampere+) — ~2x wall-clock on the sequential think loop")
     p.add_argument("--max_new", type=int, default=200, help="max generated tokens in code_eval")
+    p.add_argument("--rl_steps", type=int, default=60, help="GRPO optimization steps")
+    p.add_argument("--rollouts", type=int, default=6, help="rollouts per prompt in GRPO")
+    p.add_argument("--rl_lr", type=float, default=1e-5, help="policy LR for RL (small!)")
+    p.add_argument("--rl_temp", type=float, default=0.8, help="rollout sampling temperature")
+    p.add_argument("--rl_kl", type=float, default=0.01, help="KL penalty coefficient vs reference policy")
+    p.add_argument("--rl_pretrain", type=int, default=300, help="supervised warmup steps before RL")
+    p.add_argument("--reason_samples", type=int, default=1,
+                   help="self-consistency: sample N answers per problem, majority vote")
     args = p.parse_args()
     if args.verify:
         verify()
@@ -1421,6 +1647,8 @@ def main():
         "equal_flops": mode_equal_flops,
         "assoc_recall": mode_assoc_recall,
         "code_eval": mode_code_eval,
+        "reason_eval": mode_reason_eval,
+        "grpo": mode_grpo,
     }
     modes[args.mode](args)
 

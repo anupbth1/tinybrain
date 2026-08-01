@@ -62,4 +62,29 @@ r2 = sp.mode_equal_flops(args)
 assert r2["seeds"]["0"]["flops_v2"] > r2["seeds"]["0"]["flops_tf"]
 print("equal_flops(paths=2) Δ=%.4f ratio=%.2f" % (r2["summary"]["delta_mean"], r2["seeds"]["0"]["flops_v2"] / r2["seeds"]["0"]["flops_tf"]))
 
+# 5) GSM8K pieces: answer match + generate(temp) + rollout_logprobs + full GRPO loop (stubbed data)
+assert sp._num_match("123", "123") and not sp._num_match("124", "123")
+assert sp._num_match("1,234", "1234") and sp._num_match("5.0", "5")
+assert sp._gsm8k_ans("x #### 42") == "42"
+
+import argparse
+import torch as T
+
+def fake_gsm8k(max_samples=20000, split="train"):
+    qs = [f"what is {i} plus {i}" for i in range(24)]
+    ans = [f"#### {2 * i}" for i in range(24)]
+    return qs, ans
+
+sp.load_gsm8k = fake_gsm8k
+rl_args = argparse.Namespace(
+    seeds="0", steps=2, batch=8, samples=24, dataset="gsm8k", data_mix=None, seq_len=64,
+    thought_paths=1, label_smooth=0.0, amp=False, log_every=10, memory_sharp=None, lr=1e-3,
+    warmup=0.3, early_stop=0, think_steps=2, tf_layers=3, think_rank=None, ema=0.0,
+    max_new=16, rl_steps=2, rollouts=2, rl_lr=1e-4, rl_temp=0.9, rl_kl=0.01,
+    rl_pretrain=2, reason_samples=1,
+)
+res = sp.mode_grpo(rl_args)
+assert "gsm8k_acc_after_rl" in res
+print("GRPO loop OK, acc_after_rl =", res["gsm8k_acc_after_rl"])
+
 print("ALL_SMOKE_OK")

@@ -57,7 +57,8 @@ sp.get_loaders = fake_loaders
 args = argparse.Namespace(seeds="0", steps=8, batch=8, samples=150, dataset="tinystories",
                           data_mix=None, seq_len=64, thought_paths=2, label_smooth=0.0, amp=False,
                           log_every=4, memory_sharp=None, lr=1e-3, warmup=0.3, early_stop=0,
-                          think_steps=4, tf_layers=3, think_rank=None, ema=0.0, max_new=64)
+                          think_steps=4, tf_layers=3, think_rank=None, ema=0.0, max_new=64,
+                          compile=False)
 r2 = sp.mode_equal_flops(args)
 assert r2["seeds"]["0"]["flops_v2"] > r2["seeds"]["0"]["flops_tf"]
 print("equal_flops(paths=2) Δ=%.4f ratio=%.2f" % (r2["summary"]["delta_mean"], r2["seeds"]["0"]["flops_v2"] / r2["seeds"]["0"]["flops_tf"]))

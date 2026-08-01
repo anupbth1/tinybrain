@@ -62,6 +62,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 RES_DIR = Path("novacore/experiments/scale_path_results")
 RES_DIR.mkdir(parents=True, exist_ok=True)
 
+# Free ~2x on fp32 matmuls for Ampere+ GPUs (tf32 = 10-bit mantissa, standard
+# for training). Shrinks the V2 wall-clock gap vs the transformer.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 SEQ_LEN = 64  # fixed sequence length used by every loader in this harness
 
 # A placeholder token is WORSE than none (HF rejects it → DatasetNotFoundError).
@@ -423,7 +428,7 @@ def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, shar
 
 def train_one(model, train_loader, val_loader, steps, name, log_every=200,
               use_cosine=True, early_stop_patience_steps=0, lr=3e-4,
-              warmup_fraction=0.02, ema=0.0, amp=False, seq_len=SEQ_LEN):
+              warmup_fraction=0.02, ema=0.0, amp=False, seq_len=SEQ_LEN, compile=False):
     """Train with an LR schedule keyed to TOKENS, not steps.
 
     Why tokens: in equal-FLOPs runs the two models get different step counts.
@@ -434,7 +439,16 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
     ema>0: exponential moving average of weights; val loss is evaluated on the
     EMA weights (standard overfitting defense, usually worth ~0.1-0.3 nats).
     amp: bf16 autocast (Ampere+) — ~2x wall-clock on the sequential think loop.
+    compile: torch.compile the model (kernel fusion / CUDA graphs) — the big
+    wall-clock win for the recurrent think loop.
     """
+    if compile:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print(f"  [{name:12s}] torch.compile active")
+        except Exception as e:
+            print(f"  [{name:12s}] torch.compile unavailable: {e}")
+    orig = getattr(model, "_orig_mod", model)
     tok_per_step = train_loader.batch_size * seq_len
     total_tokens = steps * tok_per_step
     warm_tokens = max(int(total_tokens * warmup_fraction), 1)
@@ -498,7 +512,7 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
                 if vl < best_val - 1e-4:
                     best_val, best_step = vl, step
                     best_train_ema, lr_at_best = ema_loss, opt.param_groups[0]["lr"]
-                gs = gate_stats(model) if not isinstance(model, NovaModel) else {}
+                gs = gate_stats(orig) if not isinstance(orig, NovaModel) else {}
                 row = {
                     "step": step,
                     "val_loss": round(vl, 4),
@@ -536,7 +550,7 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
         "stopped_early": stopped_early,
         "time_sec": round(wall, 2),
         "history": hist,
-        "gates": gate_stats(model) if not isinstance(model, NovaModel) else {},
+        "gates": gate_stats(orig) if not isinstance(orig, NovaModel) else {},
     }
 
 
@@ -612,9 +626,9 @@ def mode_race(args):
     results = {"meta": _meta(args, "race"), "models": {}}
     print("\n=== RACE: Transformer vs Hybrid v1 vs Hybrid v2 ===")
     print("NOTE: report BEST val_loss (final can overfit, especially TF).")
-    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
-    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
-    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+    results["models"]["transformer"] = train_one(make_tf(vocab), tl, vl, args.steps, "Transformer", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+    results["models"]["hybrid_v1"] = train_one(make_tb(vocab, "hybrid_v1", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v1", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
+    results["models"]["hybrid_v2"] = train_one(make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths), tl, vl, args.steps, "hybrid_v2", args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
 
     tf_b = results["models"]["transformer"]["best_val_loss"]
     print("\n" + "=" * 64)
@@ -650,7 +664,7 @@ def mode_diagnose(args):
     print("Targets: iter_cos < 0.98 | mem_entropy_ratio < 0.85 | top1 > 0.15")
     for variant in ["hybrid_v1", "hybrid_v2"]:
         m = make_tb(vocab, variant, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
-        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+        train_one(m, tl, vl, args.steps, variant, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         batch = next(iter(vl))[0][:4]
         diag = diagnose_internals(m, batch)
         results["models"][variant] = {
@@ -679,7 +693,7 @@ def mode_think_scale(args):
         for c in m.cells:
             c.min_s = tsteps
             c.max_s = tsteps
-        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+        results["models"][name] = train_one(m, tl, vl, args.steps, name, args.log_every, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         results["models"][name]["think_steps"] = tsteps
         mf = measure_fwd_flops(m, args.seq_len)
         if mf:
@@ -733,9 +747,9 @@ def mode_verify_claim(args):
         tf_m.label_smoothing = args.label_smooth
         v2_m.label_smoothing = args.label_smooth
         tf_r = train_one(tf_m, tl, vl, args.steps, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         v2_r = train_one(v2_m, tl, vl, args.steps, f"V2_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         last_v2, last_batch = v2_m, next(iter(vl))[0][:4]
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -821,7 +835,7 @@ def mode_memory_ablation(args):
         m = make_tb(vocab, "hybrid_v2", sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths)
         m.label_smoothing = args.label_smooth
         train_one(m, tl, vl, args.steps, f"v2_s{seed}", args.log_every,
-                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+                  early_stop_patience_steps=args.log_every * 4, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         batch = next(iter(vl))[0][:4]
         internals_all.append(diagnose_internals(m, batch))
 
@@ -1026,9 +1040,9 @@ def mode_equal_flops(args):
               f"FLOPs/step ratio={f_v2/f_tf:.2f}x ({flops_method}; est {f_v2_est/f_tf_est:.2f}x) ---")
         # No early stopping: both models consume the FULL budget (fair FLOPs race).
         tf_r = train_one(tf, tl, vl, steps_tf, f"TF_s{seed}", args.log_every,
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         v2_r = train_one(v2, tl, vl, steps_v2, f"V2_s{seed}", max(50, args.log_every // 2),
-                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len)
+                         early_stop_patience_steps=args.early_stop, lr=args.lr, ema=args.ema, amp=args.amp, seq_len=args.seq_len, compile=args.compile)
         last_v2 = v2
         delta = round(v2_r["best_val_loss"] - tf_r["best_val_loss"], 4)
         results["seeds"][str(seed)] = {
@@ -1049,6 +1063,9 @@ def mode_equal_flops(args):
               f"(tf {tf_r['time_sec']:.0f}s, v2 {v2_r['time_sec']:.0f}s)")
 
     ps = paired_stats(v2_bests, tf_bests)
+    tf_secs = [s["tf_sec"] for s in results["seeds"].values()]
+    v2_secs = [s["v2_sec"] for s in results["seeds"].values()]
+    wc_ratio = statistics.mean(v2_secs) / max(statistics.mean(tf_secs), 1e-6)
     results["summary"] = {
         "tf_best_mean": round(statistics.mean(tf_bests), 4),
         "tf_best_std": round(statistics.stdev(tf_bests), 4) if len(tf_bests) > 1 else 0.0,
@@ -1056,6 +1073,9 @@ def mode_equal_flops(args):
         "v2_best_std": round(statistics.stdev(v2_bests), 4) if len(v2_bests) > 1 else 0.0,
         **ps,
         "flops_method": flops_method,
+        "tf_mean_sec": round(statistics.mean(tf_secs), 1),
+        "v2_mean_sec": round(statistics.mean(v2_secs), 1),
+        "v2_tf_wallclock_ratio": round(wc_ratio, 2),
         "v2_wins_equal_flops": bool(ps["v2_wins"] >= (len(seeds) + 1) // 2 and ps["delta_mean"] < 0),
         "stat_sig": bool(ps["n_seeds"] >= 3 and ps["p_value_paired_t"] is not None
                          and ps["p_value_paired_t"] < 0.05 and ps["delta_mean"] < 0),
@@ -1076,6 +1096,8 @@ def mode_equal_flops(args):
     print(f"Δ best (V2-TF): {ps['delta_mean']:+.4f} ± {ps['delta_std']:.4f} | "
           f"p={p_str} (paired t) | sign p={ps['sign_test_p']:.4f} | flops={flops_method}")
     print(f"V2 wins: {ps['v2_wins']}/{len(seeds)} | stat_sig={results['summary']['stat_sig']}")
+    print(f"Wall-clock: TF {results['summary']['tf_mean_sec']:.0f}s vs V2 {results['summary']['v2_mean_sec']:.0f}s "
+          f"(ratio {results['summary']['v2_tf_wallclock_ratio']:.2f}x — compile+amp+tf32 shrink this)")
     print("If V2 wins at equal FLOPs with p<0.05 across seeds → compute-efficiency claim is real.")
     _save(results, "equal_flops")
     return results

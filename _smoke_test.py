@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch
 
 import scale_path as sp
+sp.NO_SAVE = True  # smoke runs must not write result JSONs
 from scale_path import SeqDS, make_tb, train_one, measure_fwd_flops
 
 torch.manual_seed(0)

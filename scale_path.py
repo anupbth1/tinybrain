@@ -1860,7 +1860,12 @@ def _meta(args, mode):
     }
 
 
+NO_SAVE = False  # smoke tests set this to avoid polluting the results dir
+
+
 def _save(results, tag):
+    if NO_SAVE:
+        return
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = RES_DIR / f"{tag}_{ts}.json"
     with open(path, "w") as f:

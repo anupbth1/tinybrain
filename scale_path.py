@@ -1394,7 +1394,8 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
         if all(done):
             break
         with torch.no_grad():
-            logits = model(cur)["logits"][:, -1]
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=DEVICE == "cuda"):
+                logits = model(cur, last_only=True)["logits"][:, -1]
         if temp > 0:
             logits = logits / max(temp, 1e-6)
             probs = F.softmax(logits, dim=-1)
@@ -1427,10 +1428,11 @@ def rollout_logprobs_batch(model, prompt_ids_list, gen_ids_list):
     for i, (p, g) in enumerate(zip(prompt_ids_list, gen_ids_list)):
         full[i, :len(p) + len(g)] = torch.tensor(p + g, dtype=torch.long, device=DEVICE)
         starts.append(len(p))
-    logits = model(full)["logits"]  # (B, maxL, V)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=DEVICE == "cuda"):
+        logits = model(full)["logits"]  # (B, maxL, V)
     lps = torch.zeros(B, device=DEVICE)
     for i, (p, g) in enumerate(zip(prompt_ids_list, gen_ids_list)):
-        lg = F.log_softmax(logits[i], dim=-1)
+        lg = F.log_softmax(logits[i].float(), dim=-1)
         s = starts[i]
         for j, tgt in enumerate(g):
             lps[i] = lps[i] + lg[s - 1 + j, tgt]
@@ -1672,7 +1674,11 @@ def mode_grpo(args):
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
-    if args.rl_pretrain > 0:
+    if args.load_path:
+        print(f"\n=== loading SFT weights from {args.load_path} ===")
+        orig = getattr(m, "_orig_mod", m)
+        orig.load_state_dict(torch.load(args.load_path, map_location=DEVICE))
+    elif args.rl_pretrain > 0:
         print(f"\n=== SFT warmup ({args.rl_pretrain} steps) ===")
         texts = [q + " " + a for q, a in zip(prompts, answers)]
         data = _texts_to_data(texts, w2i, args.seq_len)
@@ -1681,6 +1687,14 @@ def mode_grpo(args):
         vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len), batch_size=args.batch)
         train_one(m, tl, vl, args.rl_pretrain, "sft", max(20, args.log_every // 4),
                   lr=args.lr, amp=args.amp, seq_len=args.seq_len)
+        if args.save_path:
+            orig = getattr(m, "_orig_mod", m)
+            torch.save(orig.state_dict(), args.save_path)
+            print(f"  SFT weights saved to {args.save_path}")
+
+    rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
+    if rl_think != args.think_steps:
+        print(f"  rollouts will run at think depth {rl_think} (eval stays at {args.think_steps})")
 
     ref = copy.deepcopy(m).eval()
     opt = torch.optim.AdamW(m.parameters(), lr=args.rl_lr, weight_decay=0.0)
@@ -1698,7 +1712,10 @@ def mode_grpo(args):
         for i in idx.tolist():
             qids.append(_word_encode(prompts[i], w2i))
             answers_b.append(answers[i])
-        # K rollouts per prompt, all in ONE batched generation call
+        # K rollouts per prompt, all in ONE batched generation call (think depth = rl_think)
+        if rl_think != args.think_steps:
+            for c in m.cells:
+                c.min_s = c.max_s = rl_think
         roll_prompts = [q for q in qids for _ in range(K)]
         roll_gold = [a for a in answers_b for _ in range(K)]
         full = generate_batch(m, roll_prompts, max_new=rl_max, temp=args.rl_temp)
@@ -1712,9 +1729,12 @@ def mode_grpo(args):
             mean = sum(grp) / K
             std = (sum((r - mean) ** 2 for r in grp) / K) ** 0.5
             advs += [(r - mean) / (std + 1e-4) for r in grp]
-        # one batched log-prob forward for policy + reference
+        # one batched log-prob forward for policy + reference (same think depth)
         lps = rollout_logprobs_batch(m, roll_prompts, gens)
         lprefs = rollout_logprobs_batch(ref, roll_prompts, gens)
+        if rl_think != args.think_steps:
+            for c in m.cells:
+                c.min_s = c.max_s = args.think_steps
         total = 0.0
         for (p, g), adv, lp, lpref in zip(zip(roll_prompts, gens), advs, lps, lprefs):
             # per-token normalization keeps the KL term stable across lengths
@@ -1923,10 +1943,14 @@ def main():
     p.add_argument("--rollouts", type=int, default=4, help="rollouts per prompt in GRPO")
     p.add_argument("--rl_batch", type=int, default=8, help="prompts per GRPO step (rollouts are batched)")
     p.add_argument("--rl_max_new", type=int, default=160, help="max rollout tokens in GRPO (keep small for speed)")
-    p.add_argument("--rl_lr", type=float, default=1e-5, help="policy LR for RL (small!)")
+    p.add_argument("--rl_rollout_think", type=int, default=None,
+                   help="think depth used during RL rollouts (default=think_steps). Cheaper rollouts = faster RL; eval still runs at think_steps.")
+    p.add_argument("--rl_lr", type=float, default=5e-6, help="policy LR for RL (small! 5e-6 stable, 1e-5 aggressive)")
     p.add_argument("--rl_temp", type=float, default=0.8, help="rollout sampling temperature")
-    p.add_argument("--rl_kl", type=float, default=0.01, help="KL penalty coefficient vs reference policy")
+    p.add_argument("--rl_kl", type=float, default=0.1, help="KL penalty vs reference policy (0.1 prevents reward-hacking collapse; 0.01 too weak)")
     p.add_argument("--rl_pretrain", type=int, default=300, help="supervised warmup steps before RL")
+    p.add_argument("--save_path", type=str, default=None, help="save best weights here after SFT warmup (reuse across GRPO runs)")
+    p.add_argument("--load_path", type=str, default=None, help="load weights instead of re-running SFT warmup")
     p.add_argument("--reason_samples", type=int, default=1,
                    help="self-consistency: sample N answers per problem, majority vote")
     p.add_argument("--compile", action="store_true",

@@ -77,7 +77,7 @@ class NovaModel(nn.Module):
         self.embed.weight = self.lm_head.weight
         self.label_smoothing = 0.0  # harness sets via --label_smooth
 
-    def forward(self, input_ids, labels=None, **kw):
+    def forward(self, input_ids, labels=None, last_only=False, **kw):
         B, S = input_ids.shape
         x = self.embed(input_ids)
         mask = torch.triu(torch.full((S, S), float('-inf'), device=input_ids.device), diagonal=1)
@@ -85,7 +85,7 @@ class NovaModel(nn.Module):
         for block in self.blocks:
             x = block(x, mask)
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x[:, -1:, :]) if last_only else self.lm_head(x)
         out = {"logits": logits}
         if labels is not None:
             shift = logits[..., :-1, :].contiguous()

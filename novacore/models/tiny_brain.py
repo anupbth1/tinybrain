@@ -388,7 +388,7 @@ class TinyBrainModel(nn.Module):
                 if m.bias is not None: m.bias.data.zero_()
             elif isinstance(m, nn.Embedding):
                 m.weight.data.normal_(0, s)
-    def forward(self, input_ids, labels=None, memory_states=None):
+    def forward(self, input_ids, labels=None, memory_states=None, last_only=False):
         K = self.config.num_cells
         x = self.embed(input_ids)
         if memory_states is None:
@@ -403,7 +403,10 @@ class TinyBrainModel(nn.Module):
             x = self.token_attn(x)
         x, vs = self.sc(x)
         x = self.out_mlp(x)
-        logits = self.lm_head(x)
+        # last_only: generation needs just the final token's logits; skipping
+        # the lm_head for the other positions is numerically identical and cuts
+        # ~(L-1)/L of the lm_head FLOPs (the (B,L,vocab) logits were the OOM).
+        logits = self.lm_head(x[:, -1:, :]) if last_only else self.lm_head(x)
         out = {"logits": logits, "memory_states": new_mems, "verification_scores": vs}
         if labels is not None:
             shift = logits[..., :-1, :].contiguous()

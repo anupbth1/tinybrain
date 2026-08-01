@@ -81,9 +81,10 @@ rl_args = argparse.Namespace(
     seeds="0", steps=2, batch=8, samples=24, dataset="gsm8k", data_mix=None, seq_len=64,
     thought_paths=1, label_smooth=0.0, amp=False, log_every=10, memory_sharp=None, lr=1e-3,
     warmup=0.3, early_stop=0, think_steps=2, tf_layers=3, think_rank=None, ema=0.0,
-    max_new=16, rl_steps=2, rollouts=2, rl_batch=4, rl_max_new=12, rl_lr=1e-4, rl_temp=0.9,
-    rl_kl=0.01, rl_pretrain=2, reason_samples=1, compile=False, train_break=0.8,
-    think_curriculum=None, lora=False, lora_rank=8,
+    max_new=16, rl_steps=2, rollouts=2, rl_batch=4, rl_max_new=12, rl_lr=5e-6, rl_temp=0.9,
+    rl_kl=0.1, rl_pretrain=2, reason_samples=1, compile=False, train_break=0.8,
+    think_curriculum=None, lora=False, lora_rank=8, rl_rollout_think=None,
+    save_path=None, load_path=None,
 )
 res = sp.mode_grpo(rl_args)
 assert "gsm8k_acc_after_rl" in res
@@ -112,6 +113,20 @@ assert sp._gsm8k_reward("blah #### 42", "#### 42") == 1.2
 assert sp._gsm8k_reward("blah #### 43", "#### 42") == 0.2
 assert sp._gsm8k_reward("no format", "#### 42") == 0.0
 print("partial reward OK")
+
+# 9b) last_only: last-token logits must equal full-forward last-token logits
+mm3 = make_tb(VOCAB, "hybrid_v2", think_steps=2).eval()
+xi = torch.randint(0, VOCAB, (2, 32))
+with torch.no_grad():
+    full_l = mm3(xi)["logits"][:, -1]
+    last_l = mm3(xi, last_only=True)["logits"][:, 0]
+print("last_only max diff:", (full_l - last_l).abs().max().item())
+assert torch.allclose(full_l, last_l, atol=1e-5)
+from scale_path import make_tf as _mt
+mtf = _mt(VOCAB, layers=2).eval()
+with torch.no_grad():
+    assert torch.allclose(mtf(xi)["logits"][:, -1], mtf(xi, last_only=True)["logits"][:, 0], atol=1e-5)
+print("last_only identical on both models OK")
 
 # 10) train_one with compile=True on TF: must not crash (estimate uses orig)
 from scale_path import make_tf

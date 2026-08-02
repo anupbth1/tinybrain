@@ -102,15 +102,30 @@ def _hf_load(repo_id, config=None, split="train", streaming=False):
 
 
 def _word_vocab(texts, top_k=30000, seq_len=64, max_words=50):
-    """Word-level vocab (same style as load_tinystories: first max_words per text)."""
-    words = set()
+    """Word-level vocab from the MOST-FREQUENT words (not alphabetical!).
+
+    The old sort-by-alphabet cut common words out of GSM8K (numbers and 'a..e'
+    words filled the 20k slots before 'the/what/you/there/...'), making <unk>
+    the dominant training token → the LM collapsed to predicting <unk> forever
+    (generated output was 100% '<unk> <unk> <unk>...'). Frequency selection
+    keeps the words the model actually sees. Special ids are FIXED:
+    0=<pad> 1=<unk> 2=<eos> (eos gives generation a real stop token).
+    Ties break alphabetically so the id ordering is IDENTICAL across runs
+    (required for --save_path/--load_path weight compatibility).
+    max_words=None counts the FULL text (used for GSM8K, where the long
+    chain-of-thought tail holds '#### answer').
+    """
+    from collections import Counter
+    cnt = Counter()
     for t in texts:
-        for w in t.lower().split()[:max_words]:
-            words.add(w)
-    vl = sorted(words)[:top_k]
-    w2i = {w: i + 2 for i, w in enumerate(vl)}
-    w2i["<pad>"] = 0
-    w2i["<unk>"] = 1
+        toks_ = t.lower().split()
+        if max_words:
+            toks_ = toks_[:max_words]
+        cnt.update(toks_)
+    vl = [w for w, _ in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))][:top_k]
+    w2i = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+    for i, w in enumerate(vl, start=3):
+        w2i[w] = i
     return w2i
 
 
@@ -1387,7 +1402,10 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
     max_p = max(len(p) for p in prompt_ids_list)
     cur = torch.zeros(B, max_p, dtype=torch.long, device=device)
     for i, p in enumerate(prompt_ids_list):
-        cur[i, :len(p)] = torch.tensor(p, dtype=torch.long, device=device)
+        # LEFT-pad so every row's LAST position is the true prompt end.
+        # Right-padding made short prompts predict from a pad-token position →
+        # generation started from garbage (part of the <unk>/pad collapse).
+        cur[i, max_p - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
     gens = [[] for _ in range(B)]
     done = [False] * B
     for _ in range(max_new):
@@ -1543,16 +1561,33 @@ def load_gsm8k(max_samples=20000, split="train"):
     return prompts, answers
 
 
+def _make_gsm8k_lm_data(prompts, answers, w2i, seq_len=128):
+    """Question+answer as LM text with a trailing <eos>, keeping the TAIL of
+    each sequence (not the head). The old path truncated to the first seq_len
+    words, which cut off the chain-of-thought answer ('#### <number>') in most
+    GSM8K rows — so SFT never supervised the answer and RL format reward was
+    always 0. Keeping the tail puts the answer inside every training window.
+    """
+    eos = w2i.get("<eos>", 2)
+    data = []
+    for q, a in zip(prompts, answers):
+        toks = [w2i.get(w, 1) for w in (q + " " + a).lower().split()]
+        toks.append(eos)
+        data.append(torch.tensor(toks[-seq_len:], dtype=torch.long))
+    return data
+
+
 def load_gsm8k_lm(max_samples=10000, seq_len=128):
     """GSM8K as LM data (question + answer) for supervised warmup/baseline."""
     global _GSM
     prompts, answers = load_gsm8k(max_samples, "train")
     t_p, t_a = load_gsm8k(5000, "test")
-    w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000)
+    # max_words=None: count the FULL text (incl. the long chain-of-thought
+    # tail where '#### answer' lives) so the format marker is IN the vocab.
+    w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000, max_words=None)
     _GSM.update({"w2i": w2i, "i2w": {v: k for k, v in w2i.items()},
                  "test_prompts": t_p, "test_answers": t_a})
-    texts = [q + " " + a for q, a in zip(prompts, answers)]
-    data = _texts_to_data(texts, w2i, seq_len)
+    data = _make_gsm8k_lm_data(prompts, answers, w2i, seq_len)
     print(f"  gsm8k: {len(data)} seqs vocab={len(w2i)}")
     return data, len(w2i)
 
@@ -1562,7 +1597,16 @@ def _word_encode(text, w2i):
 
 
 def _word_decode(ids, i2w):
-    return " ".join(i2w.get(i, "") for i in ids)
+    """Decode word ids to text. Stops at <eos> (2) and skips <pad>/<unk> so
+    reward/eval text is clean (no literal '<unk>' spamming the metric)."""
+    out = []
+    for i in ids:
+        if i == 2:  # <eos>
+            break
+        if i in (0, 1):  # <pad>, <unk>
+            continue
+        out.append(i2w.get(i, ""))
+    return " ".join(out)
 
 
 def _gsm8k_ans(text):
@@ -1662,20 +1706,23 @@ def mode_grpo(args):
     """
     import copy
     prompts, answers = load_gsm8k(args.samples, "train")
-    w2i = _word_vocab(prompts + answers, top_k=20000)
+    # max_words=None: count the FULL text (incl. the long chain-of-thought
+    # tail where '#### answer' lives) so the format marker is IN the vocab.
+    # The old 50-word cap + alphabetical sort made '####'/tail words OOV → the
+    # LM collapsed to <unk> and rarely saw '####' → RL format reward stayed 0.
+    t_p, t_a = load_gsm8k(5000, "test")
+    w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000, max_words=None)
     i2w = {v: k for k, v in w2i.items()}
-    if _GSM["test_prompts"]:
-        _GSM.update({"w2i": w2i, "i2w": i2w})
-    else:  # ensure test set + vocab coverage
-        t_p, t_a = load_gsm8k(5000, "test")
-        w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000)
-        i2w = {v: k for k, v in w2i.items()}
-        _GSM.update({"w2i": w2i, "i2w": i2w, "test_prompts": t_p, "test_answers": t_a})
+    _GSM.update({"w2i": w2i, "i2w": i2w, "test_prompts": t_p, "test_answers": t_a})
     vocab = len(w2i)
 
     rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
     sft_think = rl_think  # SFT at rollout depth so the model emits the '####' format during rollouts
-    m = make_tb(vocab, "hybrid_v2", think_steps=sft_think, sharp=args.memory_sharp,
+    # max_think_steps must cover the FULL eval depth — the old code built the
+    # model with think_steps=sft_think, so the 'eval at 8' log was a lie: the
+    # cell loop bound range(max_s) capped every phase at the rollout depth.
+    max_T = max(args.think_steps, rl_think)
+    m = make_tb(vocab, "hybrid_v2", think_steps=max_T, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
@@ -1685,8 +1732,9 @@ def mode_grpo(args):
         orig.load_state_dict(torch.load(args.load_path, map_location=DEVICE))
     elif args.rl_pretrain > 0:
         print(f"\n=== SFT warmup ({args.rl_pretrain} steps, think depth {sft_think}) ===")
-        texts = [q + " " + a for q, a in zip(prompts, answers)]
-        data = _texts_to_data(texts, w2i, args.seq_len)
+        for c in m.cells:
+            c.min_s = c.max_s = sft_think
+        data = _make_gsm8k_lm_data(prompts, answers, w2i, args.seq_len)
         split = int(len(data) * 0.9)
         tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len), batch_size=args.batch, shuffle=True)
         vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len), batch_size=args.batch)
@@ -1696,6 +1744,10 @@ def mode_grpo(args):
             orig = getattr(m, "_orig_mod", m)
             torch.save(orig.state_dict(), args.save_path)
             print(f"  SFT weights saved to {args.save_path}")
+    # RL rollouts always use the FULL rl_think depth (no confidence early-exit)
+    for c in m.cells:
+        c.min_s = c.max_s = rl_think
+        c.conf.thresh = 1.5
     if rl_think != args.think_steps:
         print(f"  SFT+RL at think depth {rl_think}; eval will run at {args.think_steps}")
 
@@ -1731,7 +1783,8 @@ def mode_grpo(args):
             advs += [(r - mean) / (std + 1e-4) for r in grp]
         # one batched log-prob forward for policy + reference (same think depth)
         lps = rollout_logprobs_batch(m, roll_prompts, gens)
-        lprefs = rollout_logprobs_batch(ref, roll_prompts, gens)
+        # ref is frozen: detach so no grads build/accumulate through it
+        lprefs = rollout_logprobs_batch(ref, roll_prompts, gens).detach()
         total = 0.0
         for (p, g), adv, lp, lpref in zip(zip(roll_prompts, gens), advs, lps, lprefs):
             # per-token normalization keeps the KL term stable across lengths
@@ -1750,9 +1803,11 @@ def mode_grpo(args):
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
                   f"fmt={fmt}/{len(rewards)} full={full}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
 
-    # eval at the full think depth
+    # eval at the full think depth (max_s must be raised, and the confidence
+    # threshold must not early-exit a generation in the middle of the chain)
     for c in m.cells:
         c.min_s = c.max_s = args.think_steps
+        c.conf.thresh = 1.5
     acc = eval_gsm8k(m, args, w2i, i2w)
     results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
                "gsm8k_acc_after_rl": round(acc, 4), "n_test": len(_GSM["test_prompts"]),

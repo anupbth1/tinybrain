@@ -1652,6 +1652,9 @@ def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
     if w2i is None:
         w2i, i2w = _GSM["w2i"], _GSM["i2w"]
     sample = max(1, args.reason_samples)
+    # temp>0 only when sampling: greedy (temp=0) copies are identical, so
+    # self-consistency majority vote would be a no-op (all votes = same output).
+    temp = 0.0 if sample == 1 else getattr(args, "rl_temp", 0.8)
     chunk = 32 if sample == 1 else max(8, 32 // sample)  # small: (B,L,vocab) logits are the memory hog
     correct, total = 0, 0
     for c0 in range(0, len(prompts), chunk):
@@ -1659,7 +1662,7 @@ def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
         chunk_a = answers[c0:c0 + chunk]
         qids = [_word_encode(q, w2i) for q in chunk_p]
         # sample self-consistency copies of the whole chunk
-        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=0.0)
+        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=temp)
                    for _ in range(sample)]
         for i in range(len(chunk_p)):
             preds = [_word_decode(gen_i[len(qids[i]):], i2w) for gen_i in (g[i] for g in all_ids)]

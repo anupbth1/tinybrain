@@ -230,6 +230,7 @@ class LightweightAttention(nn.Module):
             pad_key = ~pad_mask[:, None, None, :] & ~eye[None, None, :, :]
             scores = scores.masked_fill(pad_key, float("-inf"))
         attn = self.do(F.softmax(scores, dim=-1))
+        self._last_attn = attn.detach()  # instrumentation: routing entropy
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, S, self.attn_dim)
         return x + self.W_o(out)
 
@@ -255,6 +256,7 @@ class ConfidenceGate(nn.Module):
             h = torch.sigmoid((logit + noise) / 1.0)
         else:
             h = (c >= self.thresh).float()
+        self._last_c = c.detach()  # instrumentation: confidence histogram
         return c, h
 
 

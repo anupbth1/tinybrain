@@ -479,7 +479,7 @@ def make_tf(vocab, hidden=256, layers=3, heads=4, lora=False, lora_rank=8):
 
 
 def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1,
-            train_break=0.8, model_size=None):
+            train_break=0.8, model_size=None, attn_ratio=None, mem_slots=None):
     """
     variants:
       plain      — no attention
@@ -494,6 +494,8 @@ def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, shar
     True ~1B needs cells=12-16 or hidden=4096 (recurrent weights dominate; out_mlp
     and memory_slots are NOT scaled by presets). Preset think_steps wins over the
     CLI --think_steps — read m.config.max_think_steps for the effective depth.
+
+    attn_ratio/mem_slots: A/B overrides (None = proven defaults 0.5 / 16).
     """
     if model_size == "nano":
         hidden, cells, think_steps, rank = 256, 3, 4, None
@@ -512,11 +514,13 @@ def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, shar
         use_post, every, ratio = False, True, 0.5
     else:
         raise ValueError(variant)
+    if attn_ratio is not None:
+        ratio = attn_ratio
     cfg = TinyBrainConfig(
         vocab_size=vocab,
         hidden_size=hidden,
         num_cells=cells,
-        memory_slots=16,
+        memory_slots=mem_slots if mem_slots is not None else 16,
         num_think_heads=2,
         max_think_steps=think_steps,
         min_think_steps=1,

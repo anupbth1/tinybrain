@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch
 
 import scale_path as sp
-sp.NO_SAVE = True
 from scale_path import SeqDS, make_tb, generate_batch
 
 t0 = time.time()
@@ -50,6 +49,7 @@ qids = [tok.encode(f"Question: {q}\nAnswer: ") for q in prompts]
 gen = generate_batch(m, qids, max_new=160, temp=0.0, no_repeat_ngram=3,
                      eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
 strict = loose = 0
+rows = []
 for i, (g, q) in enumerate(zip(gen, qids)):
     dec = tok.decode(g[len(q):], skip_special_tokens=True)
     gold = sp._gsm8k_ans(answers[i])
@@ -57,5 +57,11 @@ for i, (g, q) in enumerate(zip(gen, qids)):
     contains = gold in dec
     strict += hit
     loose += contains
+    rows.append({"q": prompts[i][:80], "gold": gold, "pred": dec[:160], "strict": hit, "contains": contains})
     print(f"  Q{i+1:2d} gold={gold!r} strict={hit} contains={contains} pred={dec[:64]!r}", flush=True)
 print(f"MEMORIZATION: strict={strict}/20 loose={loose}/20 | {time.time()-t0:.0f}s", flush=True)
+sp._save({"meta": {"script": "overfit_gpu", "model": "tinybrain_small",
+                    "examples": 20, "steps": 300, "vocab": len(tok),
+                    "windows": len(data), "device": str(sp.DEVICE)},
+          "train_loss": last, "strict": strict, "loose": loose, "total": 20,
+          "per_question": rows}, "overfit_tb")

@@ -2056,14 +2056,27 @@ def _meta(args, mode):
 NO_SAVE = False  # smoke tests set this to avoid polluting the results dir
 
 
+def _auto_download(path):
+    """Colab: push the artifact to the browser so it lands on the user's PC.
+    RunPod/local: silently ignored (the path is printed by _save)."""
+    try:
+        from google.colab import files
+        files.download(str(path))
+        print(f"Downloaded: {path}")
+    except Exception:
+        pass
+
+
 def _save(results, tag):
     if NO_SAVE:
-        return
+        return None
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = RES_DIR / f"{tag}_{ts}.json"
     with open(path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Saved: {path}")
+    _auto_download(path)
+    return path
 
 
 def verify():

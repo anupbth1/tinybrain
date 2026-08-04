@@ -12,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch
 
 import scale_path as sp
-sp.NO_SAVE = True
 from scale_path import SeqDS, make_tf, generate_batch
 
 t0 = time.time()
@@ -58,7 +57,7 @@ qids = [tok.encode(f"Question: {q}\nAnswer: ") for q in prompts]
 # batched left-pad generation (same path as eval_gsm8k)
 g_batch = generate_batch(m, qids, max_new=160, temp=0.0, no_repeat_ngram=3,
                          eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
-score(g_batch, "batched(left-pad)")
+s_b, l_b = score(g_batch, "batched(left-pad)")
 
 # per-prompt no-pad generation
 g_single = []
@@ -73,9 +72,20 @@ for q in qids:
         if nxt == tok.eos_token_id:
             break
     g_single.append(q + ids[len(q):])
-score(g_single, "per-prompt(no-pad)")
+s_s, l_s = score(g_single, "per-prompt(no-pad)")
 
+rows = []
 for i, g in enumerate(g_single):
     dec = tok.decode(g[len(qids[i]):], skip_special_tokens=True)
-    print(f"  Q{i+1:2d} gold={sp._gsm8k_ans(answers[i])!r} pred={dec[:64]!r}", flush=True)
+    gold = sp._gsm8k_ans(answers[i])
+    rows.append({"q": prompts[i][:80], "gold": gold, "pred": dec[:160],
+                 "strict": sp._num_match(sp._gsm8k_ans(dec), gold), "contains": gold in dec})
+    print(f"  Q{i+1:2d} gold={gold!r} pred={dec[:64]!r}", flush=True)
 print(f"TF_CONTROL_DONE | {time.time()-t0:.0f}s", flush=True)
+sp._save({"meta": {"script": "overfit_tf", "model": "transformer_11M",
+                    "examples": 20, "steps": 300, "vocab": len(tok),
+                    "windows": len(data), "device": str(sp.DEVICE)},
+          "train_loss": last, "total": 20,
+          "batched_leftpad": {"strict": s_b, "loose": l_b},
+          "per_prompt_nopad": {"strict": s_s, "loose": l_s},
+          "per_question": rows}, "overfit_tf")

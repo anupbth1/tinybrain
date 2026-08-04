@@ -33,6 +33,7 @@ m.train()
 last = None
 for step in range(300):
     for x, y in tl:
+        x, y = x.to(sp.DEVICE), y.to(sp.DEVICE)
         opt.zero_grad()
         loss = m(x, labels=y)["loss"]
         loss.backward()

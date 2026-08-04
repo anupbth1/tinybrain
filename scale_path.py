@@ -660,11 +660,15 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
                 }
                 hist.append(row)
                 extra = f" | gamma={gs.get('gamma_mean', 0):.4f} gate={gs.get('out_gate_mean', 0):.4f}" if gs else ""
-                print(f"  [{name:12s}] {step:4d}/{steps} | val={vl:.4f} best={best_val:.4f} train={ema_loss:.4f}{extra}")
+                print(f"  [{name:12s}] {step:4d}/{steps} | val={vl:.4f} best={best_val:.4f} train={ema_loss:.4f}{extra}", flush=True)
                 if early_stop_patience_steps > 0 and step - best_step >= early_stop_patience_steps:
                     print(f"  [{name:12s}] early stop @ {step} (no improve for {step - best_step} steps)")
                     stopped_early = True
                     break
+            elif step % 25 == 0:
+                # Cheap live progress (no val pass) — with log_every=250 and a
+                # 6x bigger model, minutes of silence read as a hang.
+                print(f"  [{name:12s}] {step:4d}/{steps} train={ema_loss:.4f}", flush=True)
         if stopped_early or step >= steps:
             break
     wall = time.time() - t0
@@ -1803,7 +1807,7 @@ def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
             total += 1
             if total <= 3:
                 print(f"    sample {total}: gold={_gsm8k_ans(chunk_a[i])!r} pred={best!r}")
-        print(f"  gsm8k {total}/{len(prompts)} acc={correct / max(total, 1):.4f}")
+        print(f"  gsm8k {total}/{len(prompts)} acc={correct / max(total, 1):.4f}", flush=True)
     return correct / max(total, 1)
 
 
@@ -1933,7 +1937,7 @@ def mode_grpo(args):
             el = time.time() - t0
             eta = el / (step + 1) * (args.rl_steps - step - 1)
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
-                  f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
+                  f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)", flush=True)
 
     for c in m.cells:
         c.min_s = c.max_s = max_T

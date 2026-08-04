@@ -1,0 +1,79 @@
+{
+  "meta": {
+    "mode": "reason_eval",
+    "device": "cuda",
+    "steps": 400,
+    "batch": 32,
+    "samples": 5000,
+    "dataset": "gsm8k",
+    "data_mix": null,
+    "seq_len": 128,
+    "thought_paths": 1,
+    "label_smooth": 0.0,
+    "amp": true,
+    "rl_steps": 60,
+    "rollouts": 4,
+    "rl_lr": 5e-06,
+    "rl_kl": 0.1,
+    "reason_samples": 1,
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0,1,2",
+    "timestamp": "2026-08-02T07:55:09",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "multi_agent": "mixture-of-thoughts: parallel specialist paths + coordinator gate (Grok-style)",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "train": {
+    "name": "gsm8k_sft",
+    "params": 7038369,
+    "approx_flops": 566231040,
+    "final_val_loss": 4.556,
+    "best_val_loss": 4.556,
+    "best_step": 400,
+    "ema": 0.0,
+    "best_train_loss_ema": 4.6173,
+    "final_train_loss_ema": 4.6173,
+    "train_val_gap_at_best": 0.0613,
+    "lr_at_best": 1.5e-05,
+    "steps_ran": 400,
+    "tokens_seen": 1638400,
+    "tok_per_sec": 10773.9,
+    "stopped_early": false,
+    "time_sec": 152.07,
+    "history": [
+      {
+        "step": 200,
+        "val_loss": 4.7096,
+        "train_loss_ema": 4.7333,
+        "best_val_loss": 4.7096,
+        "lr": 0.000161,
+        "time_sec": 76.4,
+        "gamma_mean": 0.1037,
+        "out_gate_mean": 0.1022
+      },
+      {
+        "step": 400,
+        "val_loss": 4.556,
+        "train_loss_ema": 4.6173,
+        "best_val_loss": 4.556,
+        "lr": 1.5e-05,
+        "time_sec": 152.1,
+        "gamma_mean": 0.1058,
+        "out_gate_mean": 0.1026
+      }
+    ],
+    "trainable_params": 7038369,
+    "avg_think_steps": 8.0,
+    "gates": {
+      "gamma_mean": 0.1058,
+      "out_gate_mean": 0.1026
+    }
+  },
+  "gsm8k_acc": 0.0,
+  "n_test": 1319,
+  "reason_samples": 1
+}

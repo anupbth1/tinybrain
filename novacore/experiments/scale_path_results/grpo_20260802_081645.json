@@ -1,0 +1,397 @@
+{
+  "meta": {
+    "mode": "grpo",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 5000,
+    "dataset": "gsm8k",
+    "data_mix": null,
+    "seq_len": 64,
+    "thought_paths": 1,
+    "label_smooth": 0.0,
+    "amp": true,
+    "rl_steps": 60,
+    "rollouts": 4,
+    "rl_lr": 5e-06,
+    "rl_kl": 0.1,
+    "reason_samples": 1,
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0,1,2",
+    "timestamp": "2026-08-02T08:16:45",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "multi_agent": "mixture-of-thoughts: parallel specialist paths + coordinator gate (Grok-style)",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "rl_hist": [
+    {
+      "step": 1,
+      "loss": 0.4677,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 2,
+      "loss": -0.0071,
+      "fmt": 2,
+      "full": 0
+    },
+    {
+      "step": 3,
+      "loss": 0.0395,
+      "fmt": 2,
+      "full": 0
+    },
+    {
+      "step": 4,
+      "loss": -0.1119,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 5,
+      "loss": 0.0221,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 6,
+      "loss": 0.1215,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 7,
+      "loss": 0.3222,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 8,
+      "loss": 0.1695,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 9,
+      "loss": -0.0405,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 10,
+      "loss": 0.2442,
+      "fmt": 10,
+      "full": 0
+    },
+    {
+      "step": 11,
+      "loss": 0.505,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 12,
+      "loss": -0.1636,
+      "fmt": 2,
+      "full": 0
+    },
+    {
+      "step": 13,
+      "loss": 0.3498,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 14,
+      "loss": -0.2037,
+      "fmt": 10,
+      "full": 0
+    },
+    {
+      "step": 15,
+      "loss": 0.3789,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 16,
+      "loss": 0.2027,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 17,
+      "loss": 0.0334,
+      "fmt": 2,
+      "full": 0
+    },
+    {
+      "step": 18,
+      "loss": 0.3672,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 19,
+      "loss": -0.0487,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 20,
+      "loss": 1.3575,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 21,
+      "loss": 0.1607,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 22,
+      "loss": 0.0225,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 23,
+      "loss": 0.2416,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 24,
+      "loss": -0.0052,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 25,
+      "loss": -0.0739,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 26,
+      "loss": 0.3747,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 27,
+      "loss": 0.364,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 28,
+      "loss": 0.4988,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 29,
+      "loss": 0.4789,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 30,
+      "loss": 0.4059,
+      "fmt": 4,
+      "full": 0
+    },
+    {
+      "step": 31,
+      "loss": 1.1603,
+      "fmt": 9,
+      "full": 0
+    },
+    {
+      "step": 32,
+      "loss": -0.0823,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 33,
+      "loss": 0.0179,
+      "fmt": 1,
+      "full": 0
+    },
+    {
+      "step": 34,
+      "loss": -0.0342,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 35,
+      "loss": -0.0225,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 36,
+      "loss": 0.0637,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 37,
+      "loss": 0.2581,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 38,
+      "loss": 0.1064,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 39,
+      "loss": 0.8868,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 40,
+      "loss": 0.0824,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 41,
+      "loss": 0.2622,
+      "fmt": 4,
+      "full": 0
+    },
+    {
+      "step": 42,
+      "loss": -0.1462,
+      "fmt": 4,
+      "full": 0
+    },
+    {
+      "step": 43,
+      "loss": 0.4505,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 44,
+      "loss": 0.0297,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 45,
+      "loss": 0.1847,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 46,
+      "loss": 0.2573,
+      "fmt": 3,
+      "full": 0
+    },
+    {
+      "step": 47,
+      "loss": 0.0959,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 48,
+      "loss": 0.4065,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 49,
+      "loss": 0.4785,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 50,
+      "loss": 0.174,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 51,
+      "loss": 0.3725,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 52,
+      "loss": 0.5018,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 53,
+      "loss": 0.161,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 54,
+      "loss": 0.1815,
+      "fmt": 4,
+      "full": 0
+    },
+    {
+      "step": 55,
+      "loss": 0.4146,
+      "fmt": 11,
+      "full": 0
+    },
+    {
+      "step": 56,
+      "loss": -0.1323,
+      "fmt": 9,
+      "full": 0
+    },
+    {
+      "step": 57,
+      "loss": 0.1058,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 58,
+      "loss": -0.082,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 59,
+      "loss": 0.4482,
+      "fmt": 9,
+      "full": 0
+    },
+    {
+      "step": 60,
+      "loss": 0.6378,
+      "fmt": 14,
+      "full": 0
+    }
+  ],
+  "gsm8k_acc_after_rl": 0.0,
+  "n_test": 1319,
+  "rl_lr": 5e-06,
+  "rollouts": 4,
+  "rl_kl": 0.1
+}

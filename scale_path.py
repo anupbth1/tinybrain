@@ -305,7 +305,12 @@ class SeqDS(torch.utils.data.Dataset):
         if x.numel() < self.seq_len:
             x = torch.cat([x, torch.zeros(self.seq_len - x.numel(), dtype=torch.long)])
         x = x[: self.seq_len]
-        return x, x.clone()
+        y = x.clone()
+        # Pad (id 0) carries no signal — masking it stops the LM from learning
+        # 'predict pad' as its dominant class (21% of GSM8K targets were pad →
+        # greedy generation started with <pad> → decodes to '' → acc=0).
+        y[y == 0] = -100
+        return x, y
 
 
 def count_params(m):
@@ -1390,12 +1395,19 @@ def rollout_logprobs(model, prompt_ids, gen_ids):
     return lp
 
 
-def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, device=DEVICE):
+def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, device=DEVICE,
+                   no_repeat_ngram=0):
     """Batched autoregressive generation — all sequences advance in lockstep.
 
     Turns B×K sequential forwards into ONE batched forward per token, which is
     10-50x faster on small models (the reason GRPO felt 'too slow' before).
     Returns full id lists (prompt + generation) for every sequence.
+
+    <pad>/<unk> are masked out of the logits — they decode to '' and the model
+    falls back to them at hard positions (GSM8K acc was 0 because generation
+    started with <pad>). no_repeat_ngram>0 bans tokens that would complete an
+    n-gram already emitted (breaks 'the number of the number of…' loops in
+    greedy eval; <eos> is exempt so the model can still stop).
     """
     model.eval()
     B = len(prompt_ids_list)
@@ -1408,12 +1420,25 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
         cur[i, max_p - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
     gens = [[] for _ in range(B)]
     done = [False] * B
+    seen = [set() for _ in range(B)] if no_repeat_ngram > 0 else None
     for _ in range(max_new):
         if all(done):
             break
         with torch.no_grad():
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=DEVICE == "cuda"):
                 logits = model(cur, last_only=True)["logits"][:, -1]
+        logits[:, 0] = float("-inf")  # <pad>
+        logits[:, 1] = float("-inf")  # <unk>
+        if no_repeat_ngram > 0:
+            for i in range(B):
+                if done[i]:
+                    continue
+                g = gens[i]
+                if len(g) >= no_repeat_ngram - 1:
+                    key = tuple(g[-(no_repeat_ngram - 1):])
+                    for ng in seen[i]:
+                        if ng[:-1] == key and ng[-1] != 2:
+                            logits[i, ng[-1]] = float("-inf")
         if temp > 0:
             logits = logits / max(temp, 1e-6)
             probs = F.softmax(logits, dim=-1)
@@ -1432,6 +1457,8 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
                 gens[i].append(int(nxt[i].item()))
                 if nxt[i].item() == 2:
                     done[i] = True
+                elif no_repeat_ngram > 0 and len(gens[i]) >= no_repeat_ngram:
+                    seen[i].add(tuple(gens[i][-no_repeat_ngram:]))
         nxt = nxt * torch.tensor([not d for d in done], device=device).long()
         cur = torch.cat([cur, nxt.unsqueeze(1)], dim=1)
     return [prompt_ids_list[i] + gens[i] for i in range(B)]
@@ -1562,18 +1589,23 @@ def load_gsm8k(max_samples=20000, split="train"):
 
 
 def _make_gsm8k_lm_data(prompts, answers, w2i, seq_len=128):
-    """Question+answer as LM text with a trailing <eos>, keeping the TAIL of
-    each sequence (not the head). The old path truncated to the first seq_len
-    words, which cut off the chain-of-thought answer ('#### <number>') in most
-    GSM8K rows — so SFT never supervised the answer and RL format reward was
-    always 0. Keeping the tail puts the answer inside every training window.
+    """Question+answer as LM text with a trailing <eos>, keeping BOTH ends of
+    each sequence. The old path truncated to the first seq_len words (cut the
+    '#### answer' tail) and then to the last seq_len words (cut the
+    question→answer transition for long examples). Keeping both ends means
+    every long example contributes two windows: one with the question→answer
+    boundary, one with the '#### <number>' tail + <eos>.
     """
     eos = w2i.get("<eos>", 2)
     data = []
     for q, a in zip(prompts, answers):
         toks = [w2i.get(w, 1) for w in (q + " " + a).lower().split()]
         toks.append(eos)
-        data.append(torch.tensor(toks[-seq_len:], dtype=torch.long))
+        if len(toks) > seq_len:
+            data.append(torch.tensor(toks[:seq_len], dtype=torch.long))
+            data.append(torch.tensor(toks[-seq_len:], dtype=torch.long))
+        else:
+            data.append(torch.tensor(toks, dtype=torch.long))
     return data
 
 
@@ -1662,7 +1694,7 @@ def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
         chunk_a = answers[c0:c0 + chunk]
         qids = [_word_encode(q, w2i) for q in chunk_p]
         # sample self-consistency copies of the whole chunk
-        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=temp)
+        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=temp, no_repeat_ngram=3)
                    for _ in range(sample)]
         for i in range(len(chunk_p)):
             preds = [_word_decode(gen_i[len(qids[i]):], i2w) for gen_i in (g[i] for g in all_ids)]
@@ -1686,6 +1718,11 @@ def mode_reason_eval(args):
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
                    amp=args.amp, seq_len=args.seq_len)
+    # full-depth eval, same as mode_grpo: no confidence early-exit mid-chain
+    # (the default threshold made reason_eval generate at ~1-3 think steps).
+    for c in m.cells:
+        c.min_s = c.max_s = args.think_steps
+        c.conf.thresh = 1.5
     acc = eval_gsm8k(m, args)
     results = {"meta": _meta(args, "reason_eval"), "train": tr,
                "gsm8k_acc": round(acc, 4), "n_test": len(_GSM["test_prompts"]),
@@ -1720,7 +1757,7 @@ def mode_grpo(args):
     vocab = len(w2i)
 
     rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
-    sft_think = rl_think  # SFT at rollout depth so the model emits the '####' format during rollouts
+    sft_think = args.think_steps  # base model at FULL depth; rollouts pin down separately
     # max_think_steps must cover the FULL eval depth — the old code built the
     # model with think_steps=sft_think, so the 'eval at 8' log was a lie: the
     # cell loop bound range(max_s) capped every phase at the rollout depth.

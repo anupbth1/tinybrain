@@ -77,11 +77,21 @@ class NovaModel(nn.Module):
         self.embed.weight = self.lm_head.weight
         self.label_smoothing = 0.0  # harness sets via --label_smooth
 
-    def forward(self, input_ids, labels=None, last_only=False, **kw):
+    def forward(self, input_ids, labels=None, last_only=False, pad_mask=None, **kw):
         B, S = input_ids.shape
         x = self.embed(input_ids)
         mask = torch.triu(torch.full((S, S), float('-inf'), device=input_ids.device), diagonal=1)
-        mask = mask[None, None, :, :]
+        if pad_mask is not None:
+            # Generation-time left-pad: never attend to pad positions; each pad
+            # position may attend to itself so its state stays finite (an
+            # all--inf row would NaN-poison later 0*NaN value mixes).
+            eye = torch.eye(S, dtype=torch.bool, device=input_ids.device)
+            key_bad = (~pad_mask)[:, None, None, :] & ~eye[None, None, :, :]
+            extra = torch.zeros_like(mask[None, None])
+            extra = extra.masked_fill(key_bad, float('-inf'))
+            mask = mask[None, None] + extra
+        else:
+            mask = mask[None, None]
         for block in self.blocks:
             x = block(x, mask)
         x = self.norm(x)

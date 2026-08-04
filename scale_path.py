@@ -1464,7 +1464,10 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
             break
         with torch.no_grad():
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=DEVICE == "cuda"):
-                logits = model(cur, last_only=True)["logits"][:, -1]
+                # pad_mask: left-pad positions must not be attended to / written
+                # to memory — they only appear at window END in training, so at
+                # generation (start of prompt) they corrupt conditioning.
+                logits = model(cur, last_only=True, pad_mask=cur != pad_token_id)["logits"][:, -1]
         if pad_token_id is not None and pad_token_id != eos_token_id and pad_token_id < logits.shape[-1]:
             logits[:, pad_token_id] = float("-inf")
         if no_repeat_ngram > 0:

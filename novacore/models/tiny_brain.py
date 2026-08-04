@@ -145,7 +145,7 @@ class LearnedMemory(nn.Module):
         # memory stays frozen at M0 (isolates the READ path in ablations).
         self.read_only = False
 
-    def forward(self, x, mem=None):
+    def forward(self, x, mem=None, pad_mask=None):
         B, S, d = x.shape
         if mem is None:
             mem = self.M0.unsqueeze(0).expand(B, -1, -1).contiguous()
@@ -157,13 +157,21 @@ class LearnedMemory(nn.Module):
         k = self.keys.unsqueeze(0).expand(B, -1, -1)
         scores = torch.bmm(q, k.transpose(1, 2)) * scale
         a = F.softmax(scores, dim=-1)
+        if pad_mask is not None:
+            # Generation-time left-pad: masked positions must not write to
+            # memory (they never precede real tokens in training — without
+            # this, pad states corrupt the slots the answer position reads).
+            a = a * pad_mask.unsqueeze(2)
         self._last_attn = a.detach()
         r = torch.bmm(a, mem)
 
         if not self.read_only:
+            keep = 1.0
+            if pad_mask is not None:
+                keep = pad_mask.float().unsqueeze(-1)
             # Write to the same addressed slots (key-based), not a separate W_addr head
-            v = self.W_v(x)
-            erase = torch.sigmoid(self.W_erase(x))
+            v = self.W_v(x) * keep
+            erase = torch.sigmoid(self.W_erase(x)) * keep
             write = torch.einsum("bsm,bsd->bmd", a, v)
             mass = a.sum(dim=1).clamp_min(1e-6).unsqueeze(-1)
             write = write / mass
@@ -203,7 +211,7 @@ class LightweightAttention(nn.Module):
         nn.init.zeros_(self.W_o.weight)
         self.W_o.skip_init = True
 
-    def forward(self, x):
+    def forward(self, x, pad_mask=None):
         B, S, d = x.shape
         h = self.ln(x)
         q = self.W_q(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
@@ -212,6 +220,15 @@ class LightweightAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         causal = torch.triu(torch.full((S, S), float("-inf"), device=x.device, dtype=scores.dtype), diagonal=1)
         scores = scores + causal
+        if pad_mask is not None:
+            # Generation-time left-pad: never attend to pad positions (they
+            # only appear at window END in training; at generation they sit
+            # before the prompt and would drown out question conditioning).
+            # Each pad position may attend to ITSELF so its hidden state stays
+            # finite (an all--inf row would NaN-poison every later 0*NaN).
+            eye = torch.eye(S, dtype=torch.bool, device=x.device)
+            pad_key = ~pad_mask[:, None, None, :] & ~eye[None, None, :, :]
+            scores = scores.masked_fill(pad_key, float("-inf"))
         attn = self.do(F.softmax(scores, dim=-1))
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, S, self.attn_dim)
         return x + self.W_o(out)
@@ -273,7 +290,7 @@ class AdaptiveThinkingCell(nn.Module):
         if self.path_gate is not None:
             nn.init.zeros_(self.path_gate.weight)  # start at uniform mixture
 
-    def _run_trajectory(self, x0, memory, k, collect_trace=False):
+    def _run_trajectory(self, x0, memory, k, collect_trace=False, pad_mask=None):
         """One specialist thought path on the shared memory blackboard."""
         x = x0
         steps, csum = 0, 0.0
@@ -282,7 +299,7 @@ class AdaptiveThinkingCell(nn.Module):
         prev = None
         for t in range(self.max_s):
             x = self.think(x, step=t + k * self.max_s)
-            r, memory = self.mem(x, memory)
+            r, memory = self.mem(x, memory, pad_mask=pad_mask)
             x = x + torch.tanh(r)
             steps += 1
             if collect_trace:
@@ -306,19 +323,19 @@ class AdaptiveThinkingCell(nn.Module):
         self._steps_n += 1
         return x, memory, steps, csum, div_pen, trace
 
-    def forward(self, x, memory=None, return_trace: bool = False):
+    def forward(self, x, memory=None, return_trace: bool = False, pad_mask=None):
         x = self.W_in(x)
         if self.cell_attn is not None:
-            x = self.cell_attn(x)
+            x = self.cell_attn(x, pad_mask=pad_mask)
         x0 = x
         if self.n_paths <= 1:
-            x, memory, steps, csum, div_pen, trace = self._run_trajectory(x0, memory, 0, return_trace)
+            x, memory, steps, csum, div_pen, trace = self._run_trajectory(x0, memory, 0, return_trace, pad_mask)
         else:
             resids, memory, steps, csum = [], memory, 0, 0.0
             div_pen = x.new_zeros(())
             trace = []
             for k in range(self.n_paths):
-                xk, memory, sk, ck, dk, tk = self._run_trajectory(x0, memory, k, return_trace)
+                xk, memory, sk, ck, dk, tk = self._run_trajectory(x0, memory, k, return_trace, pad_mask)
                 resids.append(xk - x0)
                 steps += sk
                 csum += ck
@@ -388,7 +405,7 @@ class TinyBrainModel(nn.Module):
                 if m.bias is not None: m.bias.data.zero_()
             elif isinstance(m, nn.Embedding):
                 m.weight.data.normal_(0, s)
-    def forward(self, input_ids, labels=None, memory_states=None, last_only=False):
+    def forward(self, input_ids, labels=None, memory_states=None, last_only=False, pad_mask=None):
         K = self.config.num_cells
         x = self.embed(input_ids)
         if memory_states is None:
@@ -396,11 +413,11 @@ class TinyBrainModel(nn.Module):
         aux = {}
         new_mems = []
         for i, cell in enumerate(self.cells):
-            x, mem, a = cell(x, memory_states[i])
+            x, mem, a = cell(x, memory_states[i], pad_mask=pad_mask)
             new_mems.append(mem)
             for k, v in a.items(): aux[f"c{i}_{k}"] = v
         if self.token_attn is not None:
-            x = self.token_attn(x)
+            x = self.token_attn(x, pad_mask=pad_mask)
         x, vs = self.sc(x)
         x = self.out_mlp(x)
         # last_only: generation needs just the final token's logits; skipping

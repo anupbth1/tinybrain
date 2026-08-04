@@ -1,0 +1,109 @@
+{
+  "meta": {
+    "mode": "reason_eval",
+    "device": "cuda",
+    "steps": 500,
+    "batch": 16,
+    "samples": 2000,
+    "dataset": "gsm8k",
+    "data_mix": null,
+    "seq_len": 128,
+    "thought_paths": 1,
+    "label_smooth": 0.0,
+    "amp": true,
+    "rl_steps": 60,
+    "rollouts": 4,
+    "rl_lr": 5e-06,
+    "rl_kl": 0.1,
+    "reason_samples": 1,
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0,1,2",
+    "timestamp": "2026-08-04T05:42:34",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "multi_agent": "mixture-of-thoughts: parallel specialist paths + coordinator gate (Grok-style)",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "train": {
+    "name": "gsm8k_sft",
+    "params": 40743841,
+    "approx_flops": 566231040,
+    "final_val_loss": 4.312,
+    "best_val_loss": 4.312,
+    "best_step": 500,
+    "ema": 0.0,
+    "best_train_loss_ema": 4.3014,
+    "final_train_loss_ema": 4.3014,
+    "train_val_gap_at_best": -0.0106,
+    "lr_at_best": 1.5e-05,
+    "steps_ran": 500,
+    "tokens_seen": 1024000,
+    "tok_per_sec": 4210.9,
+    "stopped_early": false,
+    "time_sec": 243.18,
+    "history": [
+      {
+        "step": 100,
+        "val_loss": 5.1852,
+        "train_loss_ema": 5.4865,
+        "best_val_loss": 5.1852,
+        "lr": 0.000276,
+        "time_sec": 47.8,
+        "gamma_mean": 0.1032,
+        "out_gate_mean": 0.1028
+      },
+      {
+        "step": 200,
+        "val_loss": 4.6529,
+        "train_loss_ema": 4.8235,
+        "best_val_loss": 4.6529,
+        "lr": 0.000206,
+        "time_sec": 95.8,
+        "gamma_mean": 0.1042,
+        "out_gate_mean": 0.1032
+      },
+      {
+        "step": 300,
+        "val_loss": 4.4524,
+        "train_loss_ema": 4.541,
+        "best_val_loss": 4.4524,
+        "lr": 0.000116,
+        "time_sec": 144.1,
+        "gamma_mean": 0.1065,
+        "out_gate_mean": 0.1036
+      },
+      {
+        "step": 400,
+        "val_loss": 4.3433,
+        "train_loss_ema": 4.3578,
+        "best_val_loss": 4.3433,
+        "lr": 4.3e-05,
+        "time_sec": 193.5,
+        "gamma_mean": 0.1069,
+        "out_gate_mean": 0.1039
+      },
+      {
+        "step": 500,
+        "val_loss": 4.312,
+        "train_loss_ema": 4.3014,
+        "best_val_loss": 4.312,
+        "lr": 1.5e-05,
+        "time_sec": 243.2,
+        "gamma_mean": 0.1073,
+        "out_gate_mean": 0.104
+      }
+    ],
+    "trainable_params": 40743841,
+    "avg_think_steps": 8.0,
+    "gates": {
+      "gamma_mean": 0.1073,
+      "out_gate_mean": 0.104
+    }
+  },
+  "gsm8k_acc": 0.0008,
+  "n_test": 1319,
+  "reason_samples": 1
+}

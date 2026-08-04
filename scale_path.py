@@ -478,14 +478,32 @@ def make_tf(vocab, hidden=256, layers=3, heads=4, lora=False, lora_rank=8):
     return m
 
 
-def make_tb(vocab, variant="hybrid_v1", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1,
-            train_break=0.8):
+def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1,
+            train_break=0.8, model_size=None):
     """
     variants:
       plain      — no attention
       hybrid_v1  — post-cell lightweight attn
       hybrid_v2  — per-cell attn + step-conditioned + selective memory + diversity loss
+
+    model_size presets (overrides hidden/cells/think_steps/rank; measured at vocab=8192):
+      nano   : hidden=256,  cells=3, think_steps=4,  rank=None (~4.4M)
+      small  : hidden=512,  cells=4, think_steps=8,  rank=128  (~15M)
+      medium : hidden=1024, cells=6, think_steps=12, rank=256  (~68M)
+      1b     : hidden=2048, cells=8, think_steps=16, rank=256  (~300M)
+    True ~1B needs cells=12-16 or hidden=4096 (recurrent weights dominate; out_mlp
+    and memory_slots are NOT scaled by presets). Preset think_steps wins over the
+    CLI --think_steps — read m.config.max_think_steps for the effective depth.
     """
+    if model_size == "nano":
+        hidden, cells, think_steps, rank = 256, 3, 4, None
+    elif model_size == "small":
+        hidden, cells, think_steps, rank = 512, 4, 8, 128
+    elif model_size == "medium":
+        hidden, cells, think_steps, rank = 1024, 6, 12, 256
+    elif model_size == "1b":
+        hidden, cells, think_steps, rank = 2048, 8, 16, 256
+
     if variant == "plain":
         use_post, every, ratio = False, False, 0.25
     elif variant == "hybrid_v1":
@@ -1736,10 +1754,21 @@ def _num_match(pred, gold):
 
 
 def _gsm8k_reward(text, gold):
-    """Partial reward: format credit + exact-match credit."""
+    """Multi-component reward for reasoning: format credit + numerical match.
+
+    Sparse exact-match alone gives ZERO signal until the model can already
+    produce a perfect answer (cold start) — the loss then drifts on KL alone.
+    Shaped credits let RL learn the '<<calc>>' and '#### ' habits first, then
+    the answer: 0.1 reasoning marker + 0.2 '####' format + 0.3 calculation
+    attempt ('<<') + 1.0 exact match.
+    """
     r = 0.0
+    if "<think>" in text or "Reasoning:" in text or "Step " in text:
+        r += 0.1
     if "####" in text:
         r += 0.2
+    if "<<" in text:  # intermediate calculation attempt
+        r += 0.3
     if _num_match(_gsm8k_ans(text), _gsm8k_ans(gold)):
         r += 1.0
     return r
@@ -1781,8 +1810,10 @@ def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
 def mode_reason_eval(args):
     """Supervised baseline on GSM8K, then reasoning accuracy (self-consistency)."""
     tl, vl, vocab = get_loaders(args)  # --dataset gsm8k -- tokenizer already built in load_gsm8k_lm
-    m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
-                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
+    m = make_tb(vocab, "hybrid_v2", hidden=args.hidden_size if hasattr(args, 'hidden_size') else 256,
+                think_steps=args.think_steps, sharp=args.memory_sharp,
+                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break,
+                model_size=getattr(args, "model_size", None))
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
@@ -1820,11 +1851,15 @@ def mode_grpo(args):
     eos_id = tok.eos_token_id
     pad_id = tok.pad_token_id
 
-    rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
-    sft_think = args.think_steps
-    max_T = max(args.think_steps, rl_think)
+    max_T = max(args.think_steps, args.rl_rollout_think or 0)
     m = make_tb(vocab, "hybrid_v2", think_steps=max_T, sharp=args.memory_sharp,
-                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
+                rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break,
+                model_size=getattr(args, "model_size", None))
+    # model_size presets override think_steps — the effective depth comes from
+    # the built config, not the CLI (keeps pins and step_emb consistent).
+    max_T = m.config.max_think_steps
+    rl_think = min(args.rl_rollout_think or max_T, max_T)
+    sft_think = max_T
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
     if args.load_path:
@@ -1849,8 +1884,8 @@ def mode_grpo(args):
     for c in m.cells:
         c.min_s = c.max_s = rl_think
         c.conf.thresh = 1.5
-    if rl_think != args.think_steps:
-        print(f"  SFT+RL at think depth {rl_think}; eval will run at {args.think_steps}")
+    if rl_think != max_T:
+        print(f"  SFT+RL at think depth {rl_think}; eval will run at {max_T}")
 
     ref = copy.deepcopy(m).eval()
     opt = torch.optim.AdamW(m.parameters(), lr=args.rl_lr, weight_decay=0.0)
@@ -1901,7 +1936,7 @@ def mode_grpo(args):
                   f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
 
     for c in m.cells:
-        c.min_s = c.max_s = args.think_steps
+        c.min_s = c.max_s = max_T
         c.conf.thresh = 1.5
     acc = eval_gsm8k(m, args, tok)
     results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
@@ -2087,6 +2122,10 @@ def main():
                    help="V2 think steps in equal_flops (thesis test: does more thinking beat TF at equal FLOPs?)")
     p.add_argument("--tf_layers", type=int, default=3,
                    help="Transformer layers in equal_flops (size the baseline to match V2 compute)")
+    p.add_argument("--model_size", type=str, default=None,
+                   choices=["nano", "small", "medium", "1b"],
+                   help="architecture preset (overrides hidden/cells/think_steps/rank): "
+                        "nano ~2.4M | small ~15M | medium ~150M | 1b ~1.0B")
     p.add_argument("--think_rank", type=int, default=None,
                    help="low-rank think branches (r < hidden_size) — much cheaper thinking; None = full d×d (default)")
     p.add_argument("--ema", type=float, default=0.0,

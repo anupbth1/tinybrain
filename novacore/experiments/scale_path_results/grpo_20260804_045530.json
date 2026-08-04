@@ -1,0 +1,157 @@
+{
+  "meta": {
+    "mode": "grpo",
+    "device": "cuda",
+    "steps": 2000,
+    "batch": 32,
+    "samples": 1000,
+    "dataset": "gsm8k",
+    "data_mix": null,
+    "seq_len": 64,
+    "thought_paths": 1,
+    "label_smooth": 0.0,
+    "amp": true,
+    "rl_steps": 20,
+    "rollouts": 4,
+    "rl_lr": 5e-06,
+    "rl_kl": 0.1,
+    "reason_samples": 1,
+    "lr": 0.0003,
+    "warmup_fraction": 0.02,
+    "seeds": "0,1,2",
+    "timestamp": "2026-08-04T04:55:30",
+    "cuda_name": "Tesla T4",
+    "goal": "compute-matched: hybrid v2 vs transformer at equal total FLOPs",
+    "memory_fix": "selective slot write + sharp read",
+    "diversity_fix": "relu(cos-0.95) aux loss",
+    "multi_agent": "mixture-of-thoughts: parallel specialist paths + coordinator gate (Grok-style)",
+    "note": "LR schedule keyed to tokens (not steps); equal-FLOPs compares BEST val; paired stats over seeds"
+  },
+  "rl_hist": [
+    {
+      "step": 1,
+      "loss": -0.0273,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 2,
+      "loss": 0.0146,
+      "fmt": 9,
+      "full": 0
+    },
+    {
+      "step": 3,
+      "loss": -0.0516,
+      "fmt": 9,
+      "full": 0
+    },
+    {
+      "step": 4,
+      "loss": -0.1224,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 5,
+      "loss": 0.0785,
+      "fmt": 12,
+      "full": 0
+    },
+    {
+      "step": 6,
+      "loss": -0.113,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 7,
+      "loss": -0.0486,
+      "fmt": 4,
+      "full": 0
+    },
+    {
+      "step": 8,
+      "loss": -0.0214,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 9,
+      "loss": -0.0816,
+      "fmt": 10,
+      "full": 0
+    },
+    {
+      "step": 10,
+      "loss": -0.0635,
+      "fmt": 5,
+      "full": 0
+    },
+    {
+      "step": 11,
+      "loss": 0.0064,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 12,
+      "loss": -0.057,
+      "fmt": 10,
+      "full": 0
+    },
+    {
+      "step": 13,
+      "loss": -0.0376,
+      "fmt": 4,
+      "full": 0
+    },
+    {
+      "step": 14,
+      "loss": -0.1598,
+      "fmt": 7,
+      "full": 0
+    },
+    {
+      "step": 15,
+      "loss": -0.0738,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 16,
+      "loss": -0.1287,
+      "fmt": 8,
+      "full": 0
+    },
+    {
+      "step": 17,
+      "loss": -0.1405,
+      "fmt": 10,
+      "full": 0
+    },
+    {
+      "step": 18,
+      "loss": -0.0332,
+      "fmt": 9,
+      "full": 0
+    },
+    {
+      "step": 19,
+      "loss": -0.0577,
+      "fmt": 6,
+      "full": 0
+    },
+    {
+      "step": 20,
+      "loss": -0.1567,
+      "fmt": 8,
+      "full": 0
+    }
+  ],
+  "gsm8k_acc_after_rl": 0.0,
+  "n_test": 1319,
+  "rl_lr": 5e-06,
+  "rollouts": 4,
+  "rl_kl": 0.1
+}

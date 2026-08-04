@@ -41,6 +41,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -99,6 +105,23 @@ def _hf_load(repo_id, config=None, split="train", streaming=False):
                 time.sleep(10)
             else:
                 raise
+
+
+_TOKENIZER_CACHE = {}
+
+
+def get_tokenizer(name="Qwen/Qwen2.5-0.5B"):
+    """Fetch and cache pretrained HuggingFace tokenizer (Qwen, Llama, etc.)."""
+    global _TOKENIZER_CACHE
+    if name in _TOKENIZER_CACHE:
+        return _TOKENIZER_CACHE[name]
+    from transformers import AutoTokenizer
+    print(f"Loading pretrained tokenizer: {name}...")
+    tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    _TOKENIZER_CACHE[name] = tok
+    return tok
 
 
 def _word_vocab(texts, top_k=30000, seq_len=64, max_words=50):
@@ -294,8 +317,8 @@ def load_mixed(args):
 
 
 class SeqDS(torch.utils.data.Dataset):
-    def __init__(self, data, seq_len=64):
-        self.data, self.seq_len = data, seq_len
+    def __init__(self, data, seq_len=64, pad_id=0):
+        self.data, self.seq_len, self.pad_id = data, seq_len, pad_id
 
     def __len__(self):
         return len(self.data)
@@ -303,13 +326,11 @@ class SeqDS(torch.utils.data.Dataset):
     def __getitem__(self, i):
         x = self.data[i]
         if x.numel() < self.seq_len:
-            x = torch.cat([x, torch.zeros(self.seq_len - x.numel(), dtype=torch.long)])
+            x = torch.cat([x, torch.full((self.seq_len - x.numel(),), self.pad_id, dtype=torch.long)])
         x = x[: self.seq_len]
         y = x.clone()
-        # Pad (id 0) carries no signal — masking it stops the LM from learning
-        # 'predict pad' as its dominant class (21% of GSM8K targets were pad →
-        # greedy generation started with <pad> → decodes to '' → acc=0).
-        y[y == 0] = -100
+        # Pad carries no signal — masking it stops the LM from learning 'predict pad'
+        y[y == self.pad_id] = -100
         return x, y
 
 
@@ -620,7 +641,7 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
                     **gs,
                 }
                 hist.append(row)
-                extra = f" | γ={gs.get('gamma_mean', 0):.4f} gate={gs.get('out_gate_mean', 0):.4f}" if gs else ""
+                extra = f" | gamma={gs.get('gamma_mean', 0):.4f} gate={gs.get('out_gate_mean', 0):.4f}" if gs else ""
                 print(f"  [{name:12s}] {step:4d}/{steps} | val={vl:.4f} best={best_val:.4f} train={ema_loss:.4f}{extra}")
                 if early_stop_patience_steps > 0 and step - best_step >= early_stop_patience_steps:
                     print(f"  [{name:12s}] early stop @ {step} (no improve for {step - best_step} steps)")
@@ -709,13 +730,15 @@ def get_loaders(args, seed=0):
     elif args.dataset == "code":
         data, vocab = load_code(args.samples, args.seq_len)
     elif args.dataset == "gsm8k":
-        data, vocab = load_gsm8k_lm(args.samples, args.seq_len)
+        data, vocab = load_gsm8k_lm(args.samples, args.seq_len, getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
     else:
         data, vocab = load_tinystories(args.samples, args.seq_len)
     split = int(len(data) * 0.9)
     g = torch.Generator().manual_seed(seed)  # deterministic shuffle per seed
-    tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len), batch_size=args.batch, shuffle=True, generator=g)
-    vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len), batch_size=args.batch)
+    tok = _GSM.get("tokenizer")
+    pad_id = tok.pad_token_id if tok is not None and getattr(tok, "pad_token_id", None) is not None else 0
+    tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len, pad_id=pad_id), batch_size=args.batch, shuffle=True, generator=g)
+    vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len, pad_id=pad_id), batch_size=args.batch)
     print(f"  seqs={len(data)} vocab={vocab} device={DEVICE}")
     return tl, vl, vocab
 
@@ -734,7 +757,7 @@ def mode_race(args):
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
-    print(f"{'Model':14s} {'Params':>10s} {'BestVal':>8s} {'Final':>8s} {'Best@':>6s} {'ΔBestTF':>8s}")
+    print(f"{'Model':14s} {'Params':>10s} {'BestVal':>8s} {'Final':>8s} {'Best@':>6s} {'dBestTF':>8s}")
     for k in ["transformer", "hybrid_v1", "hybrid_v2"]:
         r = results["models"][k]
         print(
@@ -786,7 +809,7 @@ def mode_think_scale(args):
     tl, vl, vocab = get_loaders(args)
     results = {"meta": _meta(args, "think_scale"), "models": {}}
     print("\n=== THINK SCALE (fixed params, vary think steps) ===")
-    print("If more steps ⇒ lower BEST loss, compute-scaling thesis is alive.")
+    print("If more steps => lower BEST loss, compute-scaling thesis is alive.")
     for tsteps in [1, 2, 4, 8]:
         name = f"v2_T{tsteps}"
         m = make_tb(vocab, "hybrid_v2", think_steps=tsteps, sharp=args.memory_sharp, rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
@@ -1159,7 +1182,7 @@ def mode_equal_flops(args):
         }
         tf_bests.append(tf_r["best_val_loss"])
         v2_bests.append(v2_r["best_val_loss"])
-        print(f"  seed {seed}: TF={tf_r['best_val_loss']:.4f} V2={v2_r['best_val_loss']:.4f} Δ={delta:+.4f} "
+        print(f"  seed {seed}: TF={tf_r['best_val_loss']:.4f} V2={v2_r['best_val_loss']:.4f} d={delta:+.4f} "
               f"(tf {tf_r['time_sec']:.0f}s, v2 {v2_r['time_sec']:.0f}s)")
 
     ps = paired_stats(v2_bests, tf_bests)
@@ -1191,14 +1214,14 @@ def mode_equal_flops(args):
     print("\n" + "=" * 64)
     print("RESULTS (copy this block back)")
     print("=" * 64)
-    print(f"TF  best: {results['summary']['tf_best_mean']:.4f} ± {results['summary']['tf_best_std']:.4f}")
-    print(f"V2  best: {results['summary']['v2_best_mean']:.4f} ± {results['summary']['v2_best_std']:.4f}")
-    print(f"Δ best (V2-TF): {ps['delta_mean']:+.4f} ± {ps['delta_std']:.4f} | "
+    print(f"TF  best: {results['summary']['tf_best_mean']:.4f} +/- {results['summary']['tf_best_std']:.4f}")
+    print(f"V2  best: {results['summary']['v2_best_mean']:.4f} +/- {results['summary']['v2_best_std']:.4f}")
+    print(f"d best (V2-TF): {ps['delta_mean']:+.4f} +/- {ps['delta_std']:.4f} | "
           f"p={p_str} (paired t) | sign p={ps['sign_test_p']:.4f} | flops={flops_method}")
     print(f"V2 wins: {ps['v2_wins']}/{len(seeds)} | stat_sig={results['summary']['stat_sig']}")
     print(f"Wall-clock: TF {results['summary']['tf_mean_sec']:.0f}s vs V2 {results['summary']['v2_mean_sec']:.0f}s "
-          f"(ratio {results['summary']['v2_tf_wallclock_ratio']:.2f}x — compile+amp+tf32 shrink this)")
-    print("If V2 wins at equal FLOPs with p<0.05 across seeds → compute-efficiency claim is real.")
+          f"(ratio {results['summary']['v2_tf_wallclock_ratio']:.2f}x -- compile+amp+tf32 shrink this)")
+    print("If V2 wins at equal FLOPs with p<0.05 across seeds -> compute-efficiency claim is real.")
     _save(results, "equal_flops")
     return results
 
@@ -1396,27 +1419,17 @@ def rollout_logprobs(model, prompt_ids, gen_ids):
 
 
 def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, device=DEVICE,
-                   no_repeat_ngram=0):
+                   no_repeat_ngram=0, eos_token_id=2, pad_token_id=0):
     """Batched autoregressive generation — all sequences advance in lockstep.
 
     Turns B×K sequential forwards into ONE batched forward per token, which is
-    10-50x faster on small models (the reason GRPO felt 'too slow' before).
-    Returns full id lists (prompt + generation) for every sequence.
-
-    <pad>/<unk> are masked out of the logits — they decode to '' and the model
-    falls back to them at hard positions (GSM8K acc was 0 because generation
-    started with <pad>). no_repeat_ngram>0 bans tokens that would complete an
-    n-gram already emitted (breaks 'the number of the number of…' loops in
-    greedy eval; <eos> is exempt so the model can still stop).
+    10-50x faster on small models. Returns full id lists (prompt + generation).
     """
     model.eval()
     B = len(prompt_ids_list)
     max_p = max(len(p) for p in prompt_ids_list)
     cur = torch.zeros(B, max_p, dtype=torch.long, device=device)
     for i, p in enumerate(prompt_ids_list):
-        # LEFT-pad so every row's LAST position is the true prompt end.
-        # Right-padding made short prompts predict from a pad-token position →
-        # generation started from garbage (part of the <unk>/pad collapse).
         cur[i, max_p - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
     gens = [[] for _ in range(B)]
     done = [False] * B
@@ -1427,8 +1440,8 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
         with torch.no_grad():
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=DEVICE == "cuda"):
                 logits = model(cur, last_only=True)["logits"][:, -1]
-        logits[:, 0] = float("-inf")  # <pad>
-        logits[:, 1] = float("-inf")  # <unk>
+        if pad_token_id is not None and pad_token_id != eos_token_id and pad_token_id < logits.shape[-1]:
+            logits[:, pad_token_id] = float("-inf")
         if no_repeat_ngram > 0:
             for i in range(B):
                 if done[i]:
@@ -1437,7 +1450,7 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
                 if len(g) >= no_repeat_ngram - 1:
                     key = tuple(g[-(no_repeat_ngram - 1):])
                     for ng in seen[i]:
-                        if ng[:-1] == key and ng[-1] != 2:
+                        if ng[:-1] == key and ng[-1] != eos_token_id and ng[-1] < logits.shape[-1]:
                             logits[i, ng[-1]] = float("-inf")
         if temp > 0:
             logits = logits / max(temp, 1e-6)
@@ -1455,7 +1468,7 @@ def generate_batch(model, prompt_ids_list, max_new=160, temp=0.0, top_p=1.0, dev
         for i in range(B):
             if not done[i]:
                 gens[i].append(int(nxt[i].item()))
-                if nxt[i].item() == 2:
+                if nxt[i].item() == eos_token_id:
                     done[i] = True
                 elif no_repeat_ngram > 0 and len(gens[i]) >= no_repeat_ngram:
                     seen[i].add(tuple(gens[i][-no_repeat_ngram:]))
@@ -1574,7 +1587,7 @@ def mode_code_eval(args):
 
 # ── GSM8K reasoning: supervised baseline, GRPO RL, self-consistency eval ──
 
-_GSM = {"w2i": None, "i2w": None, "test_prompts": [], "test_answers": []}
+_GSM = {"tokenizer": None, "test_prompts": [], "test_answers": []}
 
 
 def load_gsm8k(max_samples=20000, split="train"):
@@ -1588,19 +1601,15 @@ def load_gsm8k(max_samples=20000, split="train"):
     return prompts, answers
 
 
-def _make_gsm8k_lm_data(prompts, answers, w2i, seq_len=128):
-    """Question+answer as LM text with a trailing <eos>, keeping BOTH ends of
-    each sequence. The old path truncated to the first seq_len words (cut the
-    '#### answer' tail) and then to the last seq_len words (cut the
-    question→answer transition for long examples). Keeping both ends means
-    every long example contributes two windows: one with the question→answer
-    boundary, one with the '#### <number>' tail + <eos>.
-    """
-    eos = w2i.get("<eos>", 2)
+def _make_gsm8k_lm_data(prompts, answers, tok, seq_len=128):
+    """Question+answer as LM text formatted for standard pretrained tokenizers."""
+    eos = tok.eos_token_id
     data = []
     for q, a in zip(prompts, answers):
-        toks = [w2i.get(w, 1) for w in (q + " " + a).lower().split()]
-        toks.append(eos)
+        formatted_text = f"Question: {q}\nAnswer: {a}"
+        toks = tok.encode(formatted_text)
+        if eos is not None and (not toks or toks[-1] != eos):
+            toks.append(eos)
         if len(toks) > seq_len:
             data.append(torch.tensor(toks[:seq_len], dtype=torch.long))
             data.append(torch.tensor(toks[-seq_len:], dtype=torch.long))
@@ -1609,36 +1618,16 @@ def _make_gsm8k_lm_data(prompts, answers, w2i, seq_len=128):
     return data
 
 
-def load_gsm8k_lm(max_samples=10000, seq_len=128):
-    """GSM8K as LM data (question + answer) for supervised warmup/baseline."""
+def load_gsm8k_lm(max_samples=10000, seq_len=128, tokenizer_name="Qwen/Qwen2.5-0.5B"):
+    """GSM8K as LM data using standard HuggingFace pretrained tokenizer."""
     global _GSM
+    tok = get_tokenizer(tokenizer_name)
     prompts, answers = load_gsm8k(max_samples, "train")
     t_p, t_a = load_gsm8k(5000, "test")
-    # max_words=None: count the FULL text (incl. the long chain-of-thought
-    # tail where '#### answer' lives) so the format marker is IN the vocab.
-    w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000, max_words=None)
-    _GSM.update({"w2i": w2i, "i2w": {v: k for k, v in w2i.items()},
-                 "test_prompts": t_p, "test_answers": t_a})
-    data = _make_gsm8k_lm_data(prompts, answers, w2i, seq_len)
-    print(f"  gsm8k: {len(data)} seqs vocab={len(w2i)}")
-    return data, len(w2i)
-
-
-def _word_encode(text, w2i):
-    return [w2i.get(w, 1) for w in text.lower().split()]
-
-
-def _word_decode(ids, i2w):
-    """Decode word ids to text. Stops at <eos> (2) and skips <pad>/<unk> so
-    reward/eval text is clean (no literal '<unk>' spamming the metric)."""
-    out = []
-    for i in ids:
-        if i == 2:  # <eos>
-            break
-        if i in (0, 1):  # <pad>, <unk>
-            continue
-        out.append(i2w.get(i, ""))
-    return " ".join(out)
+    _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a})
+    data = _make_gsm8k_lm_data(prompts, answers, tok, seq_len)
+    print(f"  gsm8k: {len(data)} seqs vocab={len(tok)}")
+    return data, len(tok)
 
 
 def _gsm8k_ans(text):
@@ -1647,7 +1636,7 @@ def _gsm8k_ans(text):
 
 def _num_match(pred, gold):
     def norm(s):
-        s = s.replace(",", "").replace(" ", "").strip()  # "1 2 3" -> "123"
+        s = s.replace(",", "").replace(" ", "").strip()
         try:
             return round(float(s), 4)
         except Exception:
@@ -1659,12 +1648,7 @@ def _num_match(pred, gold):
 
 
 def _gsm8k_reward(text, gold):
-    """Partial reward: format credit + exact-match credit.
-
-    Sparse exact-match alone gives ZERO signal until the model can already
-    produce a perfect answer (cold start) — the loss then drifts on KL alone.
-    Format credit lets RL learn the '#### ' habit first, then the answer.
-    """
+    """Partial reward: format credit + exact-match credit."""
     r = 0.0
     if "####" in text:
         r += 0.2
@@ -1673,36 +1657,34 @@ def _gsm8k_reward(text, gold):
     return r
 
 
-def eval_gsm8k(model, args, w2i=None, i2w=None, prompts=None, answers=None):
-    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency).
-
-    Generation is BATCHED (all problems at once) so eval is not a bottleneck.
-    """
+def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
+    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency)."""
     from collections import Counter
     if prompts is None:
         prompts, answers = _GSM["test_prompts"], _GSM["test_answers"]
-    if w2i is None:
-        w2i, i2w = _GSM["w2i"], _GSM["i2w"]
+    if tok is None:
+        tok = _GSM.get("tokenizer") or get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
+
+    eos_id = tok.eos_token_id
+    pad_id = tok.pad_token_id
     sample = max(1, args.reason_samples)
-    # temp>0 only when sampling: greedy (temp=0) copies are identical, so
-    # self-consistency majority vote would be a no-op (all votes = same output).
     temp = 0.0 if sample == 1 else getattr(args, "rl_temp", 0.8)
-    chunk = 32 if sample == 1 else max(8, 32 // sample)  # small: (B,L,vocab) logits are the memory hog
+    chunk = 32 if sample == 1 else max(8, 32 // sample)
     correct, total = 0, 0
     for c0 in range(0, len(prompts), chunk):
         chunk_p = prompts[c0:c0 + chunk]
         chunk_a = answers[c0:c0 + chunk]
-        qids = [_word_encode(q, w2i) for q in chunk_p]
-        # sample self-consistency copies of the whole chunk
-        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=temp, no_repeat_ngram=3)
+        qids = [tok.encode(f"Question: {q}\nAnswer: ") for q in chunk_p]
+        all_ids = [generate_batch(model, qids, max_new=args.max_new, temp=temp, no_repeat_ngram=3,
+                                  eos_token_id=eos_id, pad_token_id=pad_id)
                    for _ in range(sample)]
         for i in range(len(chunk_p)):
-            preds = [_word_decode(gen_i[len(qids[i]):], i2w) for gen_i in (g[i] for g in all_ids)]
+            preds = [tok.decode(gen_i[len(qids[i]):], skip_special_tokens=True) for gen_i in (g[i] for g in all_ids)]
             best = Counter(_gsm8k_ans(p) for p in preds).most_common(1)[0][0]
             ok = int(_num_match(best, _gsm8k_ans(chunk_a[i])))
             correct += ok
             total += 1
-            if total <= 3:  # debug: show what the model actually emits
+            if total <= 3:
                 print(f"    sample {total}: gold={_gsm8k_ans(chunk_a[i])!r} pred={best!r}")
         print(f"  gsm8k {total}/{len(prompts)} acc={correct / max(total, 1):.4f}")
     return correct / max(total, 1)
@@ -1718,12 +1700,11 @@ def mode_reason_eval(args):
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
                    amp=args.amp, seq_len=args.seq_len)
-    # full-depth eval, same as mode_grpo: no confidence early-exit mid-chain
-    # (the default threshold made reason_eval generate at ~1-3 think steps).
     for c in m.cells:
         c.min_s = c.max_s = args.think_steps
         c.conf.thresh = 1.5
-    acc = eval_gsm8k(m, args)
+    tok = _GSM.get("tokenizer") or get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
+    acc = eval_gsm8k(m, args, tok)
     results = {"meta": _meta(args, "reason_eval"), "train": tr,
                "gsm8k_acc": round(acc, 4), "n_test": len(_GSM["test_prompts"]),
                "reason_samples": args.reason_samples}
@@ -1737,30 +1718,18 @@ def mode_reason_eval(args):
 
 
 def mode_grpo(args):
-    """R1-style RL: teach the model WHEN to think and how to verify.
-
-    Group Relative Policy Optimization: sample K rollouts per prompt, score by
-    GSM8K exact match, normalize rewards within the group, then
-    L = -adv·logπ + β·KL(π‖π_ref). This is what turns a 'can think' model
-    into a 'does think' reasoner at small compute.
-    """
+    """R1-style RL: teach the model WHEN to think and how to verify."""
     import copy
+    tok = get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
     prompts, answers = load_gsm8k(args.samples, "train")
-    # max_words=None: count the FULL text (incl. the long chain-of-thought
-    # tail where '#### answer' lives) so the format marker is IN the vocab.
-    # The old 50-word cap + alphabetical sort made '####'/tail words OOV → the
-    # LM collapsed to <unk> and rarely saw '####' → RL format reward stayed 0.
     t_p, t_a = load_gsm8k(5000, "test")
-    w2i = _word_vocab(prompts + answers + t_p + t_a, top_k=20000, max_words=None)
-    i2w = {v: k for k, v in w2i.items()}
-    _GSM.update({"w2i": w2i, "i2w": i2w, "test_prompts": t_p, "test_answers": t_a})
-    vocab = len(w2i)
+    _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a})
+    vocab = len(tok)
+    eos_id = tok.eos_token_id
+    pad_id = tok.pad_token_id
 
     rl_think = min(args.rl_rollout_think or args.think_steps, args.think_steps)
-    sft_think = args.think_steps  # base model at FULL depth; rollouts pin down separately
-    # max_think_steps must cover the FULL eval depth — the old code built the
-    # model with think_steps=sft_think, so the 'eval at 8' log was a lie: the
-    # cell loop bound range(max_s) capped every phase at the rollout depth.
+    sft_think = args.think_steps
     max_T = max(args.think_steps, rl_think)
     m = make_tb(vocab, "hybrid_v2", think_steps=max_T, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
@@ -1774,17 +1743,17 @@ def mode_grpo(args):
         print(f"\n=== SFT warmup ({args.rl_pretrain} steps, think depth {sft_think}) ===")
         for c in m.cells:
             c.min_s = c.max_s = sft_think
-        data = _make_gsm8k_lm_data(prompts, answers, w2i, args.seq_len)
+        data = _make_gsm8k_lm_data(prompts, answers, tok, args.seq_len)
         split = int(len(data) * 0.9)
-        tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len), batch_size=args.batch, shuffle=True)
-        vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len), batch_size=args.batch)
+        tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len, pad_id=pad_id), batch_size=args.batch, shuffle=True)
+        vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len, pad_id=pad_id), batch_size=args.batch)
         train_one(m, tl, vl, args.rl_pretrain, "sft", max(20, args.log_every // 4),
                   lr=args.lr, amp=args.amp, seq_len=args.seq_len)
         if args.save_path:
             orig = getattr(m, "_orig_mod", m)
             torch.save(orig.state_dict(), args.save_path)
             print(f"  SFT weights saved to {args.save_path}")
-    # RL rollouts always use the FULL rl_think depth (no confidence early-exit)
+
     for c in m.cells:
         c.min_s = c.max_s = rl_think
         c.conf.thresh = 1.5
@@ -1805,29 +1774,25 @@ def mode_grpo(args):
         idx = torch.randperm(len(prompts))[: rl_batch]
         qids, answers_b = [], []
         for i in idx.tolist():
-            qids.append(_word_encode(prompts[i], w2i))
+            qids.append(tok.encode(f"Question: {prompts[i]}\nAnswer: "))
             answers_b.append(answers[i])
-        # K rollouts per prompt, all in ONE batched generation call (cells are at rl_think)
         roll_prompts = [q for q in qids for _ in range(K)]
         roll_gold = [a for a in answers_b for _ in range(K)]
-        full = generate_batch(m, roll_prompts, max_new=rl_max, temp=args.rl_temp)
+        full = generate_batch(m, roll_prompts, max_new=rl_max, temp=args.rl_temp,
+                              eos_token_id=eos_id, pad_token_id=pad_id)
         gens = [f[len(p):] for f, p in zip(full, roll_prompts)]
-        rewards = [_gsm8k_reward(_word_decode(g, i2w), a)
+        rewards = [_gsm8k_reward(tok.decode(g, skip_special_tokens=True), a)
                    for g, a in zip(gens, roll_gold)]
-        # group-relative advantage per prompt (K rollouts per group)
         advs = []
         for k0 in range(0, len(rewards), K):
             grp = rewards[k0:k0 + K]
             mean = sum(grp) / K
             std = (sum((r - mean) ** 2 for r in grp) / K) ** 0.5
             advs += [(r - mean) / (std + 1e-4) for r in grp]
-        # one batched log-prob forward for policy + reference (same think depth)
         lps = rollout_logprobs_batch(m, roll_prompts, gens)
-        # ref is frozen: detach so no grads build/accumulate through it
         lprefs = rollout_logprobs_batch(ref, roll_prompts, gens).detach()
         total = 0.0
         for (p, g), adv, lp, lpref in zip(zip(roll_prompts, gens), advs, lps, lprefs):
-            # per-token normalization keeps the KL term stable across lengths
             total += (-(adv * lp) + args.rl_kl * (lp - lpref)) / max(len(g), 1)
         loss = total / len(advs)
         opt.zero_grad()
@@ -1835,20 +1800,18 @@ def mode_grpo(args):
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step()
         fmt = sum(1 for r in rewards if r >= 0.2)
-        full = sum(1 for r in rewards if r >= 1.0)
-        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "fmt": fmt, "full": full})
+        full_cnt = sum(1 for r in rewards if r >= 1.0)
+        hist.append({"step": step + 1, "loss": round(loss.item(), 4), "fmt": fmt, "full": full_cnt})
         if (step + 1) % 5 == 0 or step + 1 == args.rl_steps:
             el = time.time() - t0
             eta = el / (step + 1) * (args.rl_steps - step - 1)
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
-                  f"fmt={fmt}/{len(rewards)} full={full}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
+                  f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)")
 
-    # eval at the full think depth (max_s must be raised, and the confidence
-    # threshold must not early-exit a generation in the middle of the chain)
     for c in m.cells:
         c.min_s = c.max_s = args.think_steps
         c.conf.thresh = 1.5
-    acc = eval_gsm8k(m, args, w2i, i2w)
+    acc = eval_gsm8k(m, args, tok)
     results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
                "gsm8k_acc_after_rl": round(acc, 4), "n_test": len(_GSM["test_prompts"]),
                "rl_lr": args.rl_lr, "rollouts": K, "rl_kl": args.rl_kl}
@@ -2012,6 +1975,8 @@ def main():
     p.add_argument("--seeds", type=str, default="0,1,2", help="comma seeds for multi-seed modes")
     p.add_argument("--dataset", choices=["tinystories", "wikitext", "openwebtext", "code", "gsm8k"], default="tinystories",
                    help="tinystories | wikitext | openwebtext | code (BPE) | gsm8k (reasoning)")
+    p.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen2.5-0.5B",
+                   help="Pretrained tokenizer name from HuggingFace (e.g. Qwen/Qwen2.5-0.5B, Qwen/Qwen2-0.5B, meta-llama/Llama-2-7b-hf)")
     p.add_argument("--data_mix", type=str, default=None,
                    help="blend word datasets into one shared vocab, e.g. tinystories:0.5,wikitext:0.3,openwebtext:0.2 "
                         "(replay-style: avoids overfitting the newest corpus)")

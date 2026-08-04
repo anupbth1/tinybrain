@@ -730,7 +730,10 @@ def get_loaders(args, seed=0):
     elif args.dataset == "code":
         data, vocab = load_code(args.samples, args.seq_len)
     elif args.dataset == "gsm8k":
-        data, vocab = load_gsm8k_lm(args.samples, args.seq_len, getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
+        gsm8k_vocab_size = getattr(args, "gsm8k_vocab_size", 8192)
+        data, vocab = load_gsm8k_lm(args.samples, args.seq_len,
+                                    getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"),
+                                    gsm8k_vocab_size=gsm8k_vocab_size)
     else:
         data, vocab = load_tinystories(args.samples, args.seq_len)
     split = int(len(data) * 0.9)
@@ -1590,6 +1593,80 @@ def mode_code_eval(args):
 _GSM = {"tokenizer": None, "test_prompts": [], "test_answers": []}
 
 
+class _BpeTokWrapper:
+    """Thin wrapper around a HuggingFace-style `tokenizers.Tokenizer` so that
+    GSM8K encode/decode calls use the same API regardless of whether we're
+    using a tiny domain BPE or a full pretrained HF tokenizer.
+    Tokens 0=<pad>, 1=<unk>, 2=<eos> (the special_tokens order in BpeTrainer).
+    """
+    def __init__(self, tok):
+        self._tok = tok
+        self.eos_token_id = tok.token_to_id("<eos>") or 2
+        self.pad_token_id = tok.token_to_id("<pad>") or 0
+
+    def __len__(self):
+        return self._tok.get_vocab_size()
+
+    def encode(self, text):
+        return self._tok.encode(text).ids
+
+    def decode(self, ids, skip_special_tokens=True):
+        text = self._tok.decode(ids)
+        if skip_special_tokens:
+            for sp in ["<pad>", "<unk>", "<eos>"]:
+                text = text.replace(sp, "")
+        return text
+
+
+_GSM_BPE_TOK = None  # module-level cache, similar to _CODE_TOK
+
+
+def _build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=8192):
+    """Train a compact BPE tokenizer on all GSM8K text (train + test).
+    Using a small vocab keeps lm_head proportional to the rest of the model.
+    vocab_size=8192 gives <3.2M lm_head params at hidden=256 — right-sized.
+    Fallback to byte tokenizer if the tokenizers library is missing.
+    """
+    global _GSM_BPE_TOK
+    if _GSM_BPE_TOK is not None and len(_GSM_BPE_TOK) == vocab_size:
+        return _GSM_BPE_TOK
+    texts = []
+    for q, a in zip(prompts + t_p, answers + t_a):
+        texts.append(f"Question: {q}\nAnswer: {a}")
+    print(f"  Training GSM8K BPE tokenizer (vocab={vocab_size}) on {len(texts)} texts...")
+    try:
+        raw_tok = _bpe_tokenizer(texts, vocab_size=vocab_size)
+        _GSM_BPE_TOK = _BpeTokWrapper(raw_tok)
+    except Exception as e:
+        print(f"  tokenizers lib error ({e}) — falling back to word vocab")
+        from collections import Counter
+        cnt = Counter()
+        for t in texts:
+            cnt.update(t.split())
+        vl = [w for w, _ in cnt.most_common(vocab_size - 3)]
+        w2i = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+        for i, w in enumerate(vl, 3):
+            w2i[w] = i
+        i2w = {v: k for k, v in w2i.items()}
+
+        class _WordTokWrapper:
+            def __init__(self, w2i, i2w):
+                self._w2i, self._i2w = w2i, i2w
+                self.eos_token_id = 2
+                self.pad_token_id = 0
+            def __len__(self): return len(self._w2i)
+            def encode(self, text):
+                return [self._w2i.get(w, 1) for w in text.lower().split()]
+            def decode(self, ids, skip_special_tokens=True):
+                out = []
+                for i in ids:
+                    if skip_special_tokens and i in (0, 1, 2): continue
+                    out.append(self._i2w.get(i, ""))
+                return " ".join(out)
+        _GSM_BPE_TOK = _WordTokWrapper(w2i, i2w)
+    return _GSM_BPE_TOK
+
+
 def load_gsm8k(max_samples=20000, split="train"):
     ds = _hf_load("openai/gsm8k", config="main", split=split)
     prompts, answers = [], []
@@ -1602,7 +1679,9 @@ def load_gsm8k(max_samples=20000, split="train"):
 
 
 def _make_gsm8k_lm_data(prompts, answers, tok, seq_len=128):
-    """Question+answer as LM text formatted for standard pretrained tokenizers."""
+    """Question+answer as LM text with a trailing <eos>, keeping BOTH ends.
+    Works with both _BpeTokWrapper and HF AutoTokenizer.
+    """
     eos = tok.eos_token_id
     data = []
     for q, a in zip(prompts, answers):
@@ -1618,12 +1697,21 @@ def _make_gsm8k_lm_data(prompts, answers, tok, seq_len=128):
     return data
 
 
-def load_gsm8k_lm(max_samples=10000, seq_len=128, tokenizer_name="Qwen/Qwen2.5-0.5B"):
-    """GSM8K as LM data using standard HuggingFace pretrained tokenizer."""
+def load_gsm8k_lm(max_samples=10000, seq_len=128, tokenizer_name="Qwen/Qwen2.5-0.5B",
+                  gsm8k_vocab_size=8192):
+    """GSM8K as LM data.
+
+    By default trains a compact domain-specific BPE (vocab=gsm8k_vocab_size=8192).
+    This keeps lm_head proportional to hidden_size=256 (~3M params vs 38M for Qwen 151k).
+    Use --gsm8k_vocab_size 0 to fall back to the pretrained HuggingFace tokenizer.
+    """
     global _GSM
-    tok = get_tokenizer(tokenizer_name)
     prompts, answers = load_gsm8k(max_samples, "train")
     t_p, t_a = load_gsm8k(5000, "test")
+    if gsm8k_vocab_size > 0:
+        tok = _build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=gsm8k_vocab_size)
+    else:
+        tok = get_tokenizer(tokenizer_name)
     _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a})
     data = _make_gsm8k_lm_data(prompts, answers, tok, seq_len)
     print(f"  gsm8k: {len(data)} seqs vocab={len(tok)}")
@@ -1692,7 +1780,7 @@ def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
 
 def mode_reason_eval(args):
     """Supervised baseline on GSM8K, then reasoning accuracy (self-consistency)."""
-    tl, vl, vocab = get_loaders(args)  # --dataset gsm8k
+    tl, vl, vocab = get_loaders(args)  # --dataset gsm8k -- tokenizer already built in load_gsm8k_lm
     m = make_tb(vocab, "hybrid_v2", think_steps=args.think_steps, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break)
     m.label_smoothing = args.label_smooth
@@ -1720,9 +1808,13 @@ def mode_reason_eval(args):
 def mode_grpo(args):
     """R1-style RL: teach the model WHEN to think and how to verify."""
     import copy
-    tok = get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
+    gsm8k_vocab_size = getattr(args, "gsm8k_vocab_size", 8192)
     prompts, answers = load_gsm8k(args.samples, "train")
     t_p, t_a = load_gsm8k(5000, "test")
+    if gsm8k_vocab_size > 0:
+        tok = _build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=gsm8k_vocab_size)
+    else:
+        tok = get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
     _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a})
     vocab = len(tok)
     eos_id = tok.eos_token_id
@@ -1976,7 +2068,11 @@ def main():
     p.add_argument("--dataset", choices=["tinystories", "wikitext", "openwebtext", "code", "gsm8k"], default="tinystories",
                    help="tinystories | wikitext | openwebtext | code (BPE) | gsm8k (reasoning)")
     p.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen2.5-0.5B",
-                   help="Pretrained tokenizer name from HuggingFace (e.g. Qwen/Qwen2.5-0.5B, Qwen/Qwen2-0.5B, meta-llama/Llama-2-7b-hf)")
+                   help="HuggingFace pretrained tokenizer (used only when --gsm8k_vocab_size 0)")
+    p.add_argument("--gsm8k_vocab_size", type=int, default=8192,
+                   help="GSM8K domain BPE vocab size (default 8192, fits hidden=256 model). "
+                        "Set 0 to use --tokenizer_name (HF Qwen/Llama) instead — "
+                        "only safe when hidden_size >= 1024 (else lm_head dominates).")
     p.add_argument("--data_mix", type=str, default=None,
                    help="blend word datasets into one shared vocab, e.g. tinystories:0.5,wikitext:0.3,openwebtext:0.2 "
                         "(replay-style: avoids overfitting the newest corpus)")

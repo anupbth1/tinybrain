@@ -79,7 +79,8 @@ def fake_gsm8k(max_samples=20000, split="train"):
 
 sp.load_gsm8k = fake_gsm8k
 rl_args = argparse.Namespace(
-    seeds="0", steps=2, batch=8, samples=24, dataset="gsm8k", tokenizer_name="Qwen/Qwen2.5-0.5B", data_mix=None, seq_len=64,
+    seeds="0", steps=2, batch=8, samples=24, dataset="gsm8k", tokenizer_name="Qwen/Qwen2.5-0.5B",
+    gsm8k_vocab_size=8192, data_mix=None, seq_len=64,
     thought_paths=1, label_smooth=0.0, amp=False, log_every=10, memory_sharp=None, lr=1e-3,
     warmup=0.3, early_stop=0, think_steps=2, tf_layers=3, think_rank=None, ema=0.0,
     max_new=16, rl_steps=2, rollouts=2, rl_batch=4, rl_max_new=12, rl_lr=5e-6, rl_temp=0.9,

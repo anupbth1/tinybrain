@@ -479,7 +479,7 @@ def make_tf(vocab, hidden=256, layers=3, heads=4, lora=False, lora_rank=8):
 
 
 def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, sharp=None, rank=None, paths=1,
-            train_break=0.8, model_size=None, attn_ratio=None, mem_slots=None):
+            train_break=0.8, model_size=None, attn_ratio=None, mem_slots=None, final_norm=None):
     """
     variants:
       plain      — no attention
@@ -495,7 +495,7 @@ def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, shar
     and memory_slots are NOT scaled by presets). Preset think_steps wins over the
     CLI --think_steps — read m.config.max_think_steps for the effective depth.
 
-    attn_ratio/mem_slots: A/B overrides (None = proven defaults 0.5 / 16).
+    attn_ratio/mem_slots/final_norm: A/B overrides (None = proven defaults).
     """
     if model_size == "nano":
         hidden, cells, think_steps, rank = 256, 3, 4, None
@@ -538,6 +538,7 @@ def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, shar
         think_rank=rank,
         num_thought_paths=paths,
         train_break=train_break,
+        final_norm=bool(final_norm) if final_norm is not None else False,
     )
     return TinyBrainModel(cfg).to(DEVICE)
 

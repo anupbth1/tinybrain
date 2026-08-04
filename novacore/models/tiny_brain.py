@@ -53,6 +53,10 @@ class TinyBrainConfig:
     out_gate_init: float = 0.1
     # Penalize near-duplicate think iterations (push iter cosine down)
     diversity_weight: float = 0.05
+    # RMSNorm the final hidden state before lm_head (standard practice; the
+    # residual stream compounds ~2x per cell, and out_mlp amplifies it ~10x —
+    # without this, logits run away and softmax is overconfident-but-wrong).
+    final_norm: bool = False
     # Softplus(memory_sharp_init) / sqrt(d) — higher ⇒ sharper slot selection
     memory_sharp_init: float = 5.0
     # Low-rank think branches (W_c/W_e1/W_e2 at rank r) — much cheaper thinking.
@@ -394,6 +398,7 @@ class TinyBrainModel(nn.Module):
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.embed.weight = self.lm_head.weight
+        self.final_norm = RMSNorm(config.hidden_size, config.layer_norm_eps) if config.final_norm else None
         self.lm = config.memory_l2_weight
         self.label_smoothing = 0.0  # harness sets via --label_smooth
         self._init()
@@ -422,6 +427,8 @@ class TinyBrainModel(nn.Module):
             x = self.token_attn(x, pad_mask=pad_mask)
         x, vs = self.sc(x)
         x = self.out_mlp(x)
+        if self.final_norm is not None:
+            x = self.final_norm(x)
         # last_only: generation needs just the final token's logits; skipping
         # the lm_head for the other positions is numerically identical and cuts
         # ~(L-1)/L of the lm_head FLOPs (the (B,L,vocab) logits were the OOM).

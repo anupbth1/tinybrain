@@ -21,11 +21,14 @@ from scale_path import SeqDS, make_tb, generate_batch
 
 attn_ratio = None
 mem_slots = None
+final_norm = None
 for a in sys.argv[1:]:
     if a.startswith("--attn_ratio="):
         attn_ratio = float(a.split("=")[1])
     if a.startswith("--mem_slots="):
         mem_slots = int(a.split("=")[1])
+    if a.startswith("--final_norm="):
+        final_norm = int(a.split("=")[1])
 
 t0 = time.time()
 prompts, answers = sp.load_gsm8k(20, "train")
@@ -37,9 +40,10 @@ tl = torch.utils.data.DataLoader(SeqDS(data, 128, pad_id=tok.pad_token_id),
 print(f"{len(data)} windows | vocab={len(tok)}", flush=True)
 
 m = make_tb(len(tok), "hybrid_v2", model_size="small",
-            attn_ratio=attn_ratio, mem_slots=mem_slots)
+            attn_ratio=attn_ratio, mem_slots=mem_slots, final_norm=final_norm)
 print(f"TB params={sum(p.numel() for p in m.parameters())/1e6:.1f}M "
       f"attn_ratio={m.config.attn_dim_ratio} mem_slots={m.config.memory_slots} "
+      f"final_norm={m.config.final_norm} "
       f"attn_dim={max(m.config.attn_heads, int(m.config.hidden_size*m.config.attn_dim_ratio))}", flush=True)
 for c in m.cells:
     c.min_s = c.max_s = m.config.max_think_steps
@@ -78,13 +82,16 @@ def make_hook(name):
     return f
 hooks = [c.register_forward_hook(make_hook(f"cell{i}")) for i, c in enumerate(m.cells)]
 m.out_mlp.register_forward_hook(make_hook("out_mlp"))
+if m.final_norm is not None:
+    m.final_norm.register_forward_hook(make_hook("final_norm"))
 with torch.no_grad():
     m(cur, pad_mask=pm)
 for h in hooks:
     h.remove()
 
 rep = {"meta": {"attn_ratio": m.config.attn_dim_ratio, "mem_slots": m.config.memory_slots,
-                "hidden": m.config.hidden_size, "params": sum(p.numel() for p in m.parameters()),
+                "hidden": m.config.hidden_size, "final_norm": m.config.final_norm,
+                "params": sum(p.numel() for p in m.parameters()),
                 "train_loss": last}, "norms": norms, "cells": {}}
 for i, c in enumerate(m.cells):
     gamma = torch.tanh(c.think.gamma).item()

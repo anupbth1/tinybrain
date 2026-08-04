@@ -1,9 +1,11 @@
 """Architecture instrumentation: 20-example overfit + routing/hidden/logit report.
 
-Run on GPU (~5 min). A/B knobs:
-  python _diag_arch.py                      # baseline (attn 0.5x, 16 slots)
-  python _diag_arch.py --attn_ratio=1.0     # full-width attention A/B
-  python _diag_arch.py --mem_slots=64       # slot count A/B
+Run on GPU (~3 min with fast defaults). A/B knobs:
+  python _diag_arch.py                          # fast baseline (150 steps, think 4)
+  python _diag_arch.py --final_norm=1           # final RMSNorm before lm_head A/B
+  python _diag_arch.py --attn_ratio=1.0         # full-width attention A/B
+  python _diag_arch.py --mem_slots=64           # slot count A/B
+  python _diag_arch.py --steps=300 --think=8    # match the earlier depth-8 runs
 
 Report (saved + printed): per-cell gamma/gate/logit_scale, memory slot mass
 (top-5 + entropy), attention entropy at the answer position, confidence mean,
@@ -22,11 +24,22 @@ from scale_path import SeqDS, make_tb, generate_batch
 attn_ratio = None
 mem_slots = None
 final_norm = None
+steps = 150
+batch = 16
+think = 4
 for a in sys.argv[1:]:
     if a.startswith("--attn_ratio="):
         attn_ratio = float(a.split("=")[1])
     if a.startswith("--mem_slots="):
         mem_slots = int(a.split("=")[1])
+    if a.startswith("--final_norm="):
+        final_norm = int(a.split("=")[1])
+    if a.startswith("--steps="):
+        steps = int(a.split("=")[1])
+    if a.startswith("--batch="):
+        batch = int(a.split("=")[1])
+    if a.startswith("--think="):
+        think = int(a.split("=")[1])
     if a.startswith("--final_norm="):
         final_norm = int(a.split("=")[1])
 
@@ -36,22 +49,22 @@ t_p, t_a = sp.load_gsm8k(20, "test")
 tok = sp._build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=4096)
 data = sp._make_gsm8k_lm_data(prompts, answers, tok, 128)
 tl = torch.utils.data.DataLoader(SeqDS(data, 128, pad_id=tok.pad_token_id),
-                                 batch_size=8, shuffle=True)
-print(f"{len(data)} windows | vocab={len(tok)}", flush=True)
+                                 batch_size=batch, shuffle=True)
+print(f"{len(data)} windows | vocab={len(tok)} | batch={batch} steps={steps} think={think}", flush=True)
 
 m = make_tb(len(tok), "hybrid_v2", model_size="small",
             attn_ratio=attn_ratio, mem_slots=mem_slots, final_norm=final_norm)
 print(f"TB params={sum(p.numel() for p in m.parameters())/1e6:.1f}M "
       f"attn_ratio={m.config.attn_dim_ratio} mem_slots={m.config.memory_slots} "
-      f"final_norm={m.config.final_norm} "
+      f"final_norm={m.config.final_norm} think={think} steps={steps} "
       f"attn_dim={max(m.config.attn_heads, int(m.config.hidden_size*m.config.attn_dim_ratio))}", flush=True)
 for c in m.cells:
-    c.min_s = c.max_s = m.config.max_think_steps
+    c.min_s = c.max_s = think
     c.conf.thresh = 1.5
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=0.01)
 m.train()
 last = None
-for step in range(300):
+for step in range(steps):
     for x, y in tl:
         x, y = x.to(sp.DEVICE), y.to(sp.DEVICE)
         opt.zero_grad()
@@ -91,6 +104,7 @@ for h in hooks:
 
 rep = {"meta": {"attn_ratio": m.config.attn_dim_ratio, "mem_slots": m.config.memory_slots,
                 "hidden": m.config.hidden_size, "final_norm": m.config.final_norm,
+                "think": think, "steps": steps,
                 "params": sum(p.numel() for p in m.parameters()),
                 "train_loss": last}, "norms": norms, "cells": {}}
 for i, c in enumerate(m.cells):

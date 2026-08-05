@@ -546,7 +546,7 @@ def make_tb(vocab, variant="hybrid_v2", hidden=256, cells=3, think_steps=4, shar
 def train_one(model, train_loader, val_loader, steps, name, log_every=200,
               use_cosine=True, early_stop_patience_steps=0, lr=3e-4,
               warmup_fraction=0.02, ema=0.0, amp=False, seq_len=SEQ_LEN, compile=False,
-              think_schedule=None):
+              think_schedule=None, input_dropout=0.0, unk_id=1):
     """Train with an LR schedule keyed to TOKENS, not steps.
 
     Why tokens: in equal-FLOPs runs the two models get different step counts.
@@ -628,6 +628,12 @@ def train_one(model, train_loader, val_loader, steps, name, log_every=200,
             if step >= steps:
                 break
             x, y = x.to(DEVICE), y.to(DEVICE)
+            if input_dropout > 0:
+                # exposure-bias fix (fast, batched): corrupt a fraction of INPUT
+                # tokens with <unk> — labels stay gold, so the model must predict
+                # from partially-wrong context, like at generation time.
+                drop = torch.rand(x.shape, device=DEVICE) < input_dropout
+                x = x.masked_fill(drop, unk_id)
             opt.zero_grad()
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and DEVICE == "cuda"):
                 loss = model(x, labels=y)["loss"]
@@ -1633,6 +1639,7 @@ class _BpeTokWrapper:
         self._tok = tok
         self.eos_token_id = tok.token_to_id("<eos>") or 2
         self.pad_token_id = tok.token_to_id("<pad>") or 0
+        self.unk_token_id = tok.token_to_id("<unk>") or 1
 
     def __len__(self):
         return self._tok.get_vocab_size()
@@ -1684,6 +1691,7 @@ def _build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=8192):
                 self._w2i, self._i2w = w2i, i2w
                 self.eos_token_id = 2
                 self.pad_token_id = 0
+                self.unk_token_id = 1
             def __len__(self): return len(self._w2i)
             def encode(self, text):
                 return [self._w2i.get(w, 1) for w in text.lower().split()]
@@ -1825,12 +1833,16 @@ def mode_reason_eval(args):
     m = make_tb(vocab, "hybrid_v2", hidden=args.hidden_size if hasattr(args, 'hidden_size') else 256,
                 think_steps=args.think_steps, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break,
-                model_size=getattr(args, "model_size", None))
+                model_size=getattr(args, "model_size", None),
+                attn_ratio=getattr(args, "attn_ratio", None),
+                final_norm=getattr(args, "final_norm", None))
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
+    unk_id = getattr(_GSM.get("tokenizer"), "unk_token_id", 1)
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
-                   amp=args.amp, seq_len=args.seq_len)
+                   amp=args.amp, seq_len=args.seq_len,
+                   input_dropout=getattr(args, "input_dropout", 0.0), unk_id=unk_id)
     for c in m.cells:
         c.min_s = c.max_s = args.think_steps
         c.conf.thresh = 1.5
@@ -1866,7 +1878,9 @@ def mode_grpo(args):
     max_T = max(args.think_steps, args.rl_rollout_think or 0)
     m = make_tb(vocab, "hybrid_v2", think_steps=max_T, sharp=args.memory_sharp,
                 rank=args.think_rank, paths=args.thought_paths, train_break=args.train_break,
-                model_size=getattr(args, "model_size", None))
+                model_size=getattr(args, "model_size", None),
+                attn_ratio=getattr(args, "attn_ratio", None),
+                final_norm=getattr(args, "final_norm", None))
     # model_size presets override think_steps — the effective depth comes from
     # the built config, not the CLI (keeps pins and step_emb consistent).
     max_T = m.config.max_think_steps
@@ -1887,7 +1901,9 @@ def mode_grpo(args):
         tl = torch.utils.data.DataLoader(SeqDS(data[:split], args.seq_len, pad_id=pad_id), batch_size=args.batch, shuffle=True)
         vl = torch.utils.data.DataLoader(SeqDS(data[split:], args.seq_len, pad_id=pad_id), batch_size=args.batch)
         train_one(m, tl, vl, args.rl_pretrain, "sft", max(20, args.log_every // 4),
-                  lr=args.lr, amp=args.amp, seq_len=args.seq_len)
+                  lr=args.lr, amp=args.amp, seq_len=args.seq_len,
+                  input_dropout=getattr(args, "input_dropout", 0.0),
+                  unk_id=getattr(tok, "unk_token_id", 1))
         if args.save_path:
             orig = getattr(m, "_orig_mod", m)
             torch.save(orig.state_dict(), args.save_path)
@@ -2153,6 +2169,13 @@ def main():
                         "nano ~2.4M | small ~15M | medium ~150M | 1b ~1.0B")
     p.add_argument("--think_rank", type=int, default=None,
                    help="low-rank think branches (r < hidden_size) — much cheaper thinking; None = full d×d (default)")
+    p.add_argument("--attn_ratio", type=float, default=None,
+                   help="A/B: attn_dim_ratio override (None = proven 0.5 for hybrid_v2; 1.0 = full-width)")
+    p.add_argument("--final_norm", type=int, default=0,
+                   help="A/B: RMSNorm the hidden state before lm_head (bounds logit runaway)")
+    p.add_argument("--input_dropout", type=float, default=0.0,
+                   help="A/B: corrupt this fraction of input tokens with <unk> during SFT "
+                        "(batched exposure-bias fix; 0.2 won the 20-example diag)")
     p.add_argument("--ema", type=float, default=0.0,
                    help="EMA decay for weights (0=off). Only helps NEAR CONVERGENCE: "
                         "use 0.99 for short runs (~100-step window), 0.999 needs 10k+ steps. "

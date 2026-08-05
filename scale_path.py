@@ -1812,7 +1812,7 @@ def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
     pad_id = tok.pad_token_id
     sample = max(1, args.reason_samples)
     temp = 0.0 if sample == 1 else getattr(args, "rl_temp", 0.8)
-    chunk = 64 if sample == 1 else max(8, 64 // sample)
+    chunk = 128 if sample == 1 else max(8, 128 // sample)
     correct, total = 0, 0
     for c0 in range(0, len(prompts), chunk):
         chunk_p = prompts[c0:c0 + chunk]

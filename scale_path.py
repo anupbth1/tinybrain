@@ -1795,18 +1795,24 @@ def _gsm8k_reward(text, gold):
 
 
 def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
-    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency)."""
+    """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency).
+
+    --eval_n>0 evaluates only the first N test problems (fast iteration);
+    --eval_think>0 caps the eval think depth (~2x faster at 4).
+    """
     from collections import Counter
     if prompts is None:
         prompts, answers = _GSM["test_prompts"], _GSM["test_answers"]
     if tok is None:
         tok = _GSM.get("tokenizer") or get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
+    n_eval = getattr(args, "eval_n", 0) or len(prompts)
+    prompts, answers = prompts[:n_eval], answers[:n_eval]
 
     eos_id = tok.eos_token_id
     pad_id = tok.pad_token_id
     sample = max(1, args.reason_samples)
     temp = 0.0 if sample == 1 else getattr(args, "rl_temp", 0.8)
-    chunk = 32 if sample == 1 else max(8, 32 // sample)
+    chunk = 64 if sample == 1 else max(8, 64 // sample)
     correct, total = 0, 0
     for c0 in range(0, len(prompts), chunk):
         chunk_p = prompts[c0:c0 + chunk]
@@ -1843,8 +1849,11 @@ def mode_reason_eval(args):
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
                    amp=args.amp, seq_len=args.seq_len,
                    input_dropout=getattr(args, "input_dropout", 0.0), unk_id=unk_id)
+    # full-depth eval, same as mode_grpo: no confidence early-exit mid-chain
+    # (the default threshold made reason_eval generate at ~1-3 think steps).
+    eval_T = getattr(args, "eval_think", 0) or args.think_steps
     for c in m.cells:
-        c.min_s = c.max_s = args.think_steps
+        c.min_s = c.max_s = eval_T
         c.conf.thresh = 1.5
     tok = _GSM.get("tokenizer") or get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
     acc = eval_gsm8k(m, args, tok)
@@ -1963,8 +1972,9 @@ def mode_grpo(args):
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
                   f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)", flush=True)
 
+    eval_T = getattr(args, "eval_think", 0) or max_T
     for c in m.cells:
-        c.min_s = c.max_s = max_T
+        c.min_s = c.max_s = eval_T
         c.conf.thresh = 1.5
     acc = eval_gsm8k(m, args, tok)
     results = {"meta": _meta(args, "grpo"), "rl_hist": hist,
@@ -2176,6 +2186,11 @@ def main():
     p.add_argument("--input_dropout", type=float, default=0.0,
                    help="A/B: corrupt this fraction of input tokens with <unk> during SFT "
                         "(batched exposure-bias fix; 0.2 won the 20-example diag)")
+    p.add_argument("--eval_n", type=int, default=0,
+                   help="evaluate only the first N GSM8K test problems (0 = all 1319; "
+                        "e.g. 300 for a ~4x faster signal)")
+    p.add_argument("--eval_think", type=int, default=0,
+                   help="eval think depth (0 = full; 4 = ~2x faster eval, matches rollout depth)")
     p.add_argument("--ema", type=float, default=0.0,
                    help="EMA decay for weights (0=off). Only helps NEAR CONVERGENCE: "
                         "use 0.99 for short runs (~100-step window), 0.999 needs 10k+ steps. "

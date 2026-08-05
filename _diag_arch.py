@@ -28,6 +28,7 @@ steps = 150
 batch = 16
 think = 4
 answer_weight = 1.0
+input_dropout = 0.0
 for a in sys.argv[1:]:
     if a.startswith("--attn_ratio="):
         attn_ratio = float(a.split("=")[1])
@@ -43,6 +44,8 @@ for a in sys.argv[1:]:
         think = int(a.split("=")[1])
     if a.startswith("--answer_weight="):
         answer_weight = float(a.split("=")[1])
+    if a.startswith("--input_dropout="):
+        input_dropout = float(a.split("=")[1])
     if a.startswith("--final_norm="):
         final_norm = int(a.split("=")[1])
 
@@ -60,13 +63,14 @@ m = make_tb(len(tok), "hybrid_v2", model_size="small",
 print(f"TB params={sum(p.numel() for p in m.parameters())/1e6:.1f}M "
       f"attn_ratio={m.config.attn_dim_ratio} mem_slots={m.config.memory_slots} "
       f"final_norm={m.config.final_norm} think={think} steps={steps} "
-      f"answer_weight={answer_weight} "
+      f"answer_weight={answer_weight} input_dropout={input_dropout} "
       f"attn_dim={max(m.config.attn_heads, int(m.config.hidden_size*m.config.attn_dim_ratio))}", flush=True)
 for c in m.cells:
     c.min_s = c.max_s = think
     c.conf.thresh = 1.5
 
 mark_id = tok.encode("####")[0]
+unk_id = 1  # <unk> (special-token order in the domain BPE / word fallback)
 print(f"answer marker token: {tok.decode([mark_id], skip_special_tokens=True)!r} (id {mark_id})", flush=True)
 
 def answer_weights(x, w_answer):
@@ -91,6 +95,13 @@ for step in range(steps):
     for x, y in tl:
         x, y = x.to(sp.DEVICE), y.to(sp.DEVICE)
         w = answer_weights(x, answer_weight).to(sp.DEVICE)
+        if input_dropout > 0:
+            # exposure-bias fix (fast, batched): corrupt a fraction of INPUT
+            # tokens with <unk> — labels stay gold, so the model must predict
+            # the next token from partially-wrong context, like at inference.
+            drop = torch.rand(x.shape, device=x.device) < input_dropout
+            drop &= x != tok.pad_token_id
+            x = x.masked_fill(drop, unk_id)
         opt.zero_grad()
         loss = m(x, labels=y, label_weights=w)["loss"]
         loss.backward()
@@ -129,6 +140,7 @@ for h in hooks:
 rep = {"meta": {"attn_ratio": m.config.attn_dim_ratio, "mem_slots": m.config.memory_slots,
                 "hidden": m.config.hidden_size, "final_norm": m.config.final_norm,
                 "think": think, "steps": steps, "answer_weight": answer_weight,
+                "input_dropout": input_dropout,
                 "params": sum(p.numel() for p in m.parameters()),
                 "train_loss": last}, "norms": norms, "cells": {}}
 for i, c in enumerate(m.cells):

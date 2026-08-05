@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -1750,14 +1751,21 @@ def load_gsm8k_lm(max_samples=10000, seq_len=128, tokenizer_name="Qwen/Qwen2.5-0
         tok = _build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=gsm8k_vocab_size)
     else:
         tok = get_tokenizer(tokenizer_name)
-    _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a})
+    _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a,
+                 "train_prompts": prompts, "train_answers": answers})
     data = _make_gsm8k_lm_data(prompts, answers, tok, seq_len)
     print(f"  gsm8k: {len(data)} seqs vocab={len(tok)}")
     return data, len(tok)
 
 
 def _gsm8k_ans(text):
-    return text.split("####")[-1].strip() if "####" in text else text.strip()
+    """Answer extraction: text after the last '####', else the LAST number in
+    the text (standard GSM8K practice — models often write '= 18' without the
+    '####' marker; without this fallback those get scored wrong)."""
+    if "####" in text:
+        return text.split("####")[-1].strip()
+    m = re.findall(r"[-+]?\d[\d,]*\.?\d*", text)
+    return m[-1] if m else text.strip()
 
 
 def _num_match(pred, gold):
@@ -1797,12 +1805,19 @@ def _gsm8k_reward(text, gold):
 def eval_gsm8k(model, args, tok=None, prompts=None, answers=None):
     """GSM8K accuracy; --reason_samples>1 → majority vote (self-consistency).
 
-    --eval_n>0 evaluates only the first N test problems (fast iteration);
-    --eval_think>0 caps the eval think depth (~2x faster at 4).
+    --eval_n>0 evaluates only the first N problems (fast iteration);
+    --eval_think>0 caps the eval think depth (~2x faster at 4);
+    --eval_split train evaluates the TRAIN questions the model memorized
+    (diagnostic: high train acc + low test acc = generalization gap, not an
+    eval bug; both use this same code path).
     """
     from collections import Counter
     if prompts is None:
-        prompts, answers = _GSM["test_prompts"], _GSM["test_answers"]
+        split = getattr(args, "eval_split", "test")
+        if split == "train":
+            prompts, answers = _GSM["train_prompts"], _GSM["train_answers"]
+        else:
+            prompts, answers = _GSM["test_prompts"], _GSM["test_answers"]
     if tok is None:
         tok = _GSM.get("tokenizer") or get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
     n_eval = getattr(args, "eval_n", 0) or len(prompts)
@@ -1849,6 +1864,10 @@ def mode_reason_eval(args):
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
                    amp=args.amp, seq_len=args.seq_len,
                    input_dropout=getattr(args, "input_dropout", 0.0), unk_id=unk_id)
+    if args.save_path:
+        orig = getattr(m, "_orig_mod", m)
+        torch.save(orig.state_dict(), args.save_path)
+        print(f"  SFT weights saved to {args.save_path}")
     # full-depth eval, same as mode_grpo: no confidence early-exit mid-chain
     # (the default threshold made reason_eval generate at ~1-3 think steps).
     eval_T = getattr(args, "eval_think", 0) or args.think_steps
@@ -1879,7 +1898,8 @@ def mode_grpo(args):
         tok = _build_gsm8k_bpe(prompts, answers, t_p, t_a, vocab_size=gsm8k_vocab_size)
     else:
         tok = get_tokenizer(getattr(args, "tokenizer_name", "Qwen/Qwen2.5-0.5B"))
-    _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a})
+    _GSM.update({"tokenizer": tok, "test_prompts": t_p, "test_answers": t_a,
+                 "train_prompts": prompts, "train_answers": answers})
     vocab = len(tok)
     eos_id = tok.eos_token_id
     pad_id = tok.pad_token_id
@@ -2191,6 +2211,9 @@ def main():
                         "e.g. 300 for a ~4x faster signal)")
     p.add_argument("--eval_think", type=int, default=0,
                    help="eval think depth (0 = full; 4 = ~2x faster eval, matches rollout depth)")
+    p.add_argument("--eval_split", choices=["test", "train"], default="test",
+                   help="evaluate test (unseen) or train (memorized) questions — the "
+                        "train/test contrast proves eval correctness vs generalization")
     p.add_argument("--ema", type=float, default=0.0,
                    help="EMA decay for weights (0=off). Only helps NEAR CONVERGENCE: "
                         "use 0.99 for short runs (~100-step window), 0.999 needs 10k+ steps. "

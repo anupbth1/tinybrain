@@ -412,7 +412,8 @@ class TinyBrainModel(nn.Module):
                 if m.bias is not None: m.bias.data.zero_()
             elif isinstance(m, nn.Embedding):
                 m.weight.data.normal_(0, s)
-    def forward(self, input_ids, labels=None, memory_states=None, last_only=False, pad_mask=None):
+    def forward(self, input_ids, labels=None, memory_states=None, last_only=False, pad_mask=None,
+                label_weights=None):
         K = self.config.num_cells
         x = self.embed(input_ids)
         if memory_states is None:
@@ -437,8 +438,18 @@ class TinyBrainModel(nn.Module):
         if labels is not None:
             shift = logits[..., :-1, :].contiguous()
             target = labels[..., 1:].contiguous()
-            L_lm = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1),
-                                   ignore_index=-100, label_smoothing=self.label_smoothing)
+            if label_weights is not None:
+                # Per-position loss weights (e.g. boost the '#### answer' region).
+                # reduction='none' + ignore_index gives 0 at -100 positions, so
+                # masked pads contribute nothing; normalize by the weight sum.
+                w = label_weights[..., 1:].contiguous().view(-1)
+                L_lm = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1),
+                                       ignore_index=-100, label_smoothing=self.label_smoothing,
+                                       reduction="none")
+                L_lm = (L_lm * w).sum() / max(w.sum(), 1.0)
+            else:
+                L_lm = F.cross_entropy(shift.view(-1, self.config.vocab_size), target.view(-1),
+                                       ignore_index=-100, label_smoothing=self.label_smoothing)
             L_mem = sum(m.pow(2).mean() for m in new_mems if m is not None) * self.lm
             L_aux = sum(aux.values()) if aux else 0
             out["loss"] = L_lm + L_mem + L_aux

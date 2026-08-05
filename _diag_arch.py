@@ -27,6 +27,7 @@ final_norm = None
 steps = 150
 batch = 16
 think = 4
+answer_weight = 1.0
 for a in sys.argv[1:]:
     if a.startswith("--attn_ratio="):
         attn_ratio = float(a.split("=")[1])
@@ -40,6 +41,8 @@ for a in sys.argv[1:]:
         batch = int(a.split("=")[1])
     if a.startswith("--think="):
         think = int(a.split("=")[1])
+    if a.startswith("--answer_weight="):
+        answer_weight = float(a.split("=")[1])
     if a.startswith("--final_norm="):
         final_norm = int(a.split("=")[1])
 
@@ -57,18 +60,39 @@ m = make_tb(len(tok), "hybrid_v2", model_size="small",
 print(f"TB params={sum(p.numel() for p in m.parameters())/1e6:.1f}M "
       f"attn_ratio={m.config.attn_dim_ratio} mem_slots={m.config.memory_slots} "
       f"final_norm={m.config.final_norm} think={think} steps={steps} "
+      f"answer_weight={answer_weight} "
       f"attn_dim={max(m.config.attn_heads, int(m.config.hidden_size*m.config.attn_dim_ratio))}", flush=True)
 for c in m.cells:
     c.min_s = c.max_s = think
     c.conf.thresh = 1.5
+
+mark_id = tok.encode("####")[0]
+print(f"answer marker token: {tok.decode([mark_id], skip_special_tokens=True)!r} (id {mark_id})", flush=True)
+
+def answer_weights(x, w_answer):
+    """Per-position loss weights: 1 everywhere, w_answer after the last '####',
+    0 on pads (matching the -100 label mask)."""
+    w = torch.ones_like(x, dtype=torch.float)
+    w[x == tok.pad_token_id] = 0.0
+    if w_answer > 1:
+        idx = torch.arange(x.size(1), device=x.device)
+        last = torch.full((x.size(0),), -1, device=x.device, dtype=torch.long)
+        for b in range(x.size(0)):
+            pos = (x[b] == mark_id).nonzero()
+            if pos.numel():
+                last[b] = pos[-1].item()
+        after = (idx.unsqueeze(0) > last.unsqueeze(1)) & (last.unsqueeze(1) >= 0)
+        w = w * (1.0 + (w_answer - 1.0) * after.float())
+    return w
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=0.01)
 m.train()
 last = None
 for step in range(steps):
     for x, y in tl:
         x, y = x.to(sp.DEVICE), y.to(sp.DEVICE)
+        w = answer_weights(x, answer_weight).to(sp.DEVICE)
         opt.zero_grad()
-        loss = m(x, labels=y)["loss"]
+        loss = m(x, labels=y, label_weights=w)["loss"]
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step()
@@ -104,7 +128,7 @@ for h in hooks:
 
 rep = {"meta": {"attn_ratio": m.config.attn_dim_ratio, "mem_slots": m.config.memory_slots,
                 "hidden": m.config.hidden_size, "final_norm": m.config.final_norm,
-                "think": think, "steps": steps,
+                "think": think, "steps": steps, "answer_weight": answer_weight,
                 "params": sum(p.numel() for p in m.parameters()),
                 "train_loss": last}, "norms": norms, "cells": {}}
 for i, c in enumerate(m.cells):

@@ -1859,6 +1859,10 @@ def mode_reason_eval(args):
                 final_norm=getattr(args, "final_norm", None))
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
+    sft_T = getattr(args, "sft_think", 0)
+    if sft_T:
+        for c in m.cells:
+            c.min_s = c.max_s = sft_T
     unk_id = getattr(_GSM.get("tokenizer"), "unk_token_id", 1)
     tr = train_one(m, tl, vl, args.steps, "gsm8k_sft", args.log_every,
                    early_stop_patience_steps=args.early_stop, lr=args.lr,
@@ -1914,7 +1918,7 @@ def mode_grpo(args):
     # the built config, not the CLI (keeps pins and step_emb consistent).
     max_T = m.config.max_think_steps
     rl_think = min(args.rl_rollout_think or max_T, max_T)
-    sft_think = max_T
+    sft_think = getattr(args, "sft_think", 0) or max_T
     m.label_smoothing = args.label_smooth
     m = maybe_compile(m, args)
     if args.load_path:
@@ -2214,6 +2218,8 @@ def main():
     p.add_argument("--eval_split", choices=["test", "train"], default="test",
                    help="evaluate test (unseen) or train (memorized) questions — the "
                         "train/test contrast proves eval correctness vs generalization")
+    p.add_argument("--sft_think", type=int, default=0,
+                   help="SFT think depth (0 = adaptive; 4 = ~2x faster SFT, diag-verified at 16/20)")
     p.add_argument("--ema", type=float, default=0.0,
                    help="EMA decay for weights (0=off). Only helps NEAR CONVERGENCE: "
                         "use 0.99 for short runs (~100-step window), 0.999 needs 10k+ steps. "

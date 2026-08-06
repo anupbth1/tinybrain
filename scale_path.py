@@ -1782,21 +1782,16 @@ def _num_match(pred, gold):
 
 
 def _gsm8k_reward(text, gold):
-    """Multi-component reward for reasoning: format credit + numerical match.
+    """RL reward: 0.2 format credit (####) + 1.0 exact match.
 
-    Sparse exact-match alone gives ZERO signal until the model can already
-    produce a perfect answer (cold start) — the loss then drifts on KL alone.
-    Shaped credits let RL learn the '<<calc>>' and '#### ' habits first, then
-    the answer: 0.1 reasoning marker + 0.2 '####' format + 0.3 calculation
-    attempt ('<<') + 1.0 exact match.
+    The earlier 0.1 (think marker) + 0.3 (<< calc) credits were REMOVED: they
+    were reachable by digit/format spam without solving, so the policy drifted
+    to '#### 123123123...' (fmt=32/32, full=0/32 collapse). Exact match must
+    dominate the gradient; format credit only nudges the #### habit.
     """
     r = 0.0
-    if "<think>" in text or "Reasoning:" in text or "Step " in text:
-        r += 0.1
     if "####" in text:
         r += 0.2
-    if "<<" in text:  # intermediate calculation attempt
-        r += 0.3
     if _num_match(_gsm8k_ans(text), _gsm8k_ans(gold)):
         r += 1.0
     return r
@@ -1993,8 +1988,14 @@ def mode_grpo(args):
         if (step + 1) % 5 == 0 or step + 1 == args.rl_steps:
             el = time.time() - t0
             eta = el / (step + 1) * (args.rl_steps - step - 1)
+            mean_r = sum(rewards) / max(len(rewards), 1)
+            r0 = 0
+            dec0 = tok.decode(gens[r0], skip_special_tokens=True)[:80]
+            gold0 = roll_gold[r0].split("####")[-1].strip()
             print(f"  [grpo] {step + 1}/{args.rl_steps} loss={loss.item():.4f} "
-                  f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} ({el:.0f}s, eta {eta / 60:.0f}min)", flush=True)
+                  f"fmt={fmt}/{len(rewards)} full={full_cnt}/{len(rewards)} "
+                  f"rew={mean_r:.3f} ({el:.0f}s, eta {eta / 60:.0f}min)", flush=True)
+            print(f"         ex: gold={gold0!r} rew={rewards[r0]:.1f} out={dec0!r}", flush=True)
 
     eval_T = getattr(args, "eval_think", 0) or max_T
     for c in m.cells:
